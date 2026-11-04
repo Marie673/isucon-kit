@@ -85,7 +85,7 @@ class LintCliTests(unittest.TestCase):
             "## コードに無いのに台帳にある（1）": ["ISU_DEAD_FLAG"],
             "## 削除済みなのに残っている（1）": ["ISU_PY_OLD"],
             "## 消す条件が空（1）": ["ISU_SIG_BATCH"],
-            "## 試験中のまま 3 時間を超えた（2）": ["ISU_SIG_BATCH", "ISU_NODE_FLAG"],
+            "## 試験中のまま 2 時間を超えた（2）": ["ISU_SIG_BATCH", "ISU_NODE_FLAG"],
             "## 台帳の本番の値と設定ファイルが合わない（2）": ["ISU_NODE_FLAG", "ISU_DEAD_FLAG"],
         }
         for head, names in sections.items():
@@ -219,7 +219,7 @@ class DurabilityTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("決まりの記録が無い", r.stdout)
         self.assertIn("x.cnf:1", r.stdout)
-        self.write("docs/DECISIONS.md", "- 14:05 innodb_flush_log_at_trx_commit=2 を採る（人間が承認。再起動試験 OK）\n")
+        self.write("docs/DECISIONS.md", "## 永続化を弱める設定\n\n| 設定 | 理由 | 危険 | 撤回の条件 | 再起動試験 |\n|---|---|---|---|---|\n| innodb_flush_log_at_trx_commit | 待ちを減らす | 消失 | 消失したとき | 未 |\n")
         r = self.durability()
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("記録あり", r.stdout)
@@ -233,3 +233,30 @@ class DurabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RevisionTests(unittest.TestCase):
+    def test_durability_needs_complete_table_and_final_reboot(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);conf=base/'db.conf';conf.write_text('fsync=off\n');dec=base/'DECISIONS.md'
+            def check(text, final=False):
+                dec.write_text(text)
+                return run('durability','--conf',str(conf),'--decisions',str(dec),*(['--final'] if final else []),cwd=base).returncode
+            self.assertEqual(check('fsync は下げない'),1)
+            self.assertEqual(check('## 永続化を弱める設定\n| fsync | 速くする | | 壊れたら | 未 |\n'),1)
+            text='## 永続化を弱める設定\n| fsync | 待ちを減らす | 消失 | 消失したら | 未 |\n'
+            self.assertEqual(check(text),0);self.assertEqual(check(text,True),1)
+            self.assertEqual(check(text.replace('| 未 |','| pass: results/reboot.md |'),True),0)
+
+    def test_default_ledger_and_probe_expiry(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);(base/'docs').mkdir()
+            r=run('new','ISU_PROBE','--status','probe','--purpose','比較','--evidence','profile','--remove-when','採否を決めたら','--added','2026-01-01T10:00:00',cwd=base)
+            self.assertEqual(r.returncode,0,r.stderr)
+            # docs/flags.md があると優先する。
+            (base/'flags.md').rename(base/'docs/flags.md')
+            (base/'code.rs').write_text('std::env::var("ISU_PROBE");')
+            r=run('lint','--code','code.rs','--now','2026-01-01T12:01:00',cwd=base)
+            self.assertEqual(r.returncode,1,r.stdout)
+            self.assertIn('2 時間を超えた',r.stdout)

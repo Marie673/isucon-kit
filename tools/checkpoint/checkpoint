@@ -1,70 +1,73 @@
-#!/usr/bin/env bash
-# checkpoint — 決まった区切りに、主ループへ「監査・見直し」を促す（Claude Code の PostToolUse hook）。
-#
-#   tools/checkpoint/checkpoint start [HH:MM]   開始の時刻を記録する（省略すると今。本番は 10:00）
-#   tools/checkpoint/checkpoint status          区切りの一覧と、出したかどうか
-#   tools/checkpoint/checkpoint hook            hook から呼ぶ。期限の来た区切りを 1 回だけ出す
-#
-# 区切りは同じディレクトリの checkpoints.tsv（開始からの分<TAB>ID<TAB>文）。
-# 記録は git のディレクトリの中（コミットされない）。開始が記録されていなければ何もしない。
-# skill の文章に頼らず、時刻が来たら必ず割り込むための仕組み。裁定そのものは情報で出す（skill main-loop）。
-set -uo pipefail
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""終盤の時刻表から区切りを通知する。"""
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
 
-here=$(cd "$(dirname "$0")" && pwd)
-root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || exit 0
-gd=$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null) || exit 0
-st="$gd/checkpoint"
-tsv="$here/checkpoints.tsv"
 
-cmd=${1:-hook}
-case "$cmd" in
-  start)
-    mkdir -p "$st"
-    if [ -n "${2:-}" ]; then
-      t=$(date -j -f '%Y-%m-%d %H:%M' "$(date +%F) $2" +%s 2>/dev/null || date -d "$(date +%F) $2" +%s)
-    else
-      t=$(date +%s)
-    fi
-    echo "$t" > "$st/start"; : > "$st/fired"
-    echo "開始: $(date -r "$t" '+%F %T' 2>/dev/null || date -d "@$t" '+%F %T')"
-    ;;
-  status)
-    [ -f "$st/start" ] || { echo "開始が未記録（checkpoint start）"; exit 0; }
-    s=$(cat "$st/start"); now=$(date +%s)
-    while IFS=$'\t' read -r off id msg; do
-      case "$off" in ''|\#*) continue ;; esac
-      due=$((s + off * 60))
-      mark=" "; grep -qx "$id" "$st/fired" 2>/dev/null && mark="✓"
-      printf '%s T+%d:%02d %-10s %s\n' "$mark" $((off / 60)) $((off % 60)) "$id" "$( [ "$now" -ge "$due" ] && echo 期限済み || echo 未来)"
-    done < "$tsv"
-    ;;
-  hook)
-    cat > /dev/null  # hook の入力（JSON）は使わない
-    [ -f "$st/start" ] && [ -f "$tsv" ] || exit 0
-    s=$(cat "$st/start"); now=$(date +%s); out=""
-    while IFS=$'\t' read -r off id msg; do
-      case "$off" in ''|\#*) continue ;; esac
-      [ "$now" -ge $((s + off * 60)) ] || continue
-      grep -qx "$id" "$st/fired" 2>/dev/null && continue
-      echo "$id" >> "$st/fired"
-      out+="[checkpoint $id T+$((off / 60)):$(printf %02d $((off % 60)))] $msg"$'\n'
-    done < "$tsv"
-    # 情報の合図: 作戦ボード（docs/README.md の判断の数字）を最後に直してから、ベンチが 3 本以上流れた
-    sm="$root/docs/README.md"
-    if [ -f "$sm" ] && [ -d "$root/results" ]; then
-      smt=$(git -C "$root" log -1 --format=%ct -- docs/README.md 2>/dev/null); smt=${smt:-0}
-      n=$(find "$root/results" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-*' -newermt "@$smt" 2>/dev/null | wc -l | tr -d ' ')
-      if [ "${n:-0}" -ge 3 ] && ! grep -qx "stale-$smt" "$st/fired" 2>/dev/null; then
-        echo "stale-$smt" >> "$st/fired"
-        out+="[checkpoint stale] 作戦ボードの判断の数字を最後に直してから、ベンチが ${n} 本流れた。表（点・点の式の項・取りこぼし・今の律速・撤回の条件）を直してから次の手を選ぶ。撤回の条件を満たしていたら裁定を出し直す。効く項を止めているものを律速に選ぶ（skill audit の 3・7c）。"$'\n'
-      fi
-    fi
-    [ -n "$out" ] || exit 0
-    if command -v jq >/dev/null; then
-      jq -n --arg c "$out" '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $c}}'
-    else
-      printf '%s' "$out" >&2; exit 2
-    fi
-    ;;
-  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
-esac
+def schedule(start, end=None):
+    due = [(start + 1800, 'design', '制約と最初の計測から docs/design.md の骨格を書く。'),
+           (start + 3600, 'audit', '見たもの → 考え → 決めたことを根拠と突き合わせる。')]
+    if end is not None:
+        due += [(end - 7200, 'review', '前提を見直し、試験中のフラグを片付ける。'),
+                (end - 3600, 'reboot', '再起動試験と直後のベンチを確認する。'),
+                (end - 1800, 'final', 'docs/RULES.md の時刻表で凍結を確認する。最終ベンチは tools/stop-rule/stop-rule で決める。')]
+    return sorted(due)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('command', choices=['start', 'status', 'hook'], default='hook', nargs='?')
+    p.add_argument('at', nargs='?'); p.add_argument('--end-at')
+    a = p.parse_args()
+    try:
+        root = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip())
+        gd = Path(subprocess.check_output(['git', 'rev-parse', '--absolute-git-dir'], text=True).strip())
+    except subprocess.CalledProcessError:
+        return 0
+    state = gd / 'checkpoint.json'
+    if a.command == 'start':
+        start = time.time()
+        if a.at:
+            start = datetime.datetime.fromisoformat(datetime.date.today().isoformat() + 'T' + a.at).timestamp()
+        end = a.end_at or os.environ.get('ISU_END_AT')
+        if not end and (root / 'isu.env').exists():
+            end = subprocess.check_output(['bash', '-c', 'source "$1"; printf %s "$ISU_END_AT"', 'bash', str(root / 'isu.env')], text=True).strip()
+        end = datetime.datetime.fromisoformat(end.replace('Z', '+00:00')).timestamp() if end else None
+        state.write_text(json.dumps({'schedule': schedule(start, end), 'fired': []}))
+        print('checkpoint: 開始を記録しました'); return 0
+    if a.command == 'hook':
+        sys.stdin.read()
+    if not state.exists():
+        return 0
+    data = json.loads(state.read_text()); messages = []
+    for due, id, message in data['schedule']:
+        if a.command == 'status':
+            print(datetime.datetime.fromtimestamp(due).isoformat(), id, '済' if id in data['fired'] else '未')
+        elif due <= time.time() and id not in data['fired']:
+            data['fired'].append(id); messages.append('[checkpoint ' + id + '] ' + message)
+    if a.command == 'hook':
+        # 作戦ボードの最終コミット以後に3本あれば一度だけ促す。
+        raw = subprocess.check_output(['git', 'log', '-1', '--format=%ct', '--', 'docs/README.md'], text=True).strip()
+        since = int(raw or 0)
+        n = sum(p.stat().st_mtime > since for p in (root / 'results').glob('*/meta.env'))
+        key = 'stale-' + str(since)
+        if n >= 3 and key not in data['fired']:
+            data['fired'].append(key)
+            messages.append('作戦ボードの判断の数字を直す。効く項・取りこぼし・今のボトルネック・撤回の条件を確かめる。')
+        state.write_text(json.dumps(data))
+        if messages:
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': '\n'.join(messages)}}, ensure_ascii=False))
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

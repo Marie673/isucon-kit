@@ -1,0 +1,245 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""平文 HTTP の pcap とアクセスログから利用者の動線を読む。"""
+from __future__ import annotations
+import argparse
+import collections
+import gzip
+import hashlib
+import ipaddress
+import json
+from pathlib import Path
+import re
+import struct
+import sys
+
+MAX_BODY = 4096
+MAX_STREAM = 16 * 1024 * 1024
+
+
+def packets(path):
+    with open(path, 'rb') as f:
+        header = f.read(24)
+        if len(header) != 24:
+            raise ValueError('pcap のヘッダーが短い')
+        magics = {b'\xd4\xc3\xb2\xa1': ('<', 1e6), b'\xa1\xb2\xc3\xd4': ('>', 1e6),
+                  b'\x4d\x3c\xb2\xa1': ('<', 1e9), b'\xa1\xb2\x3c\x4d': ('>', 1e9)}
+        if header[:4] not in magics:
+            raise ValueError('通常の pcap だけに対応する。pcapng は変換する')
+        endian, scale = magics[header[:4]]
+        link = struct.unpack(endian + 'I', header[20:24])[0]
+        if link not in (0, 1, 113, 276):
+            raise ValueError(f'未対応のリンク種別: {link}')
+        while raw := f.read(16):
+            if len(raw) < 16:
+                raise ValueError('pcap のレコードが短い')
+            sec, fraction, size, _ = struct.unpack(endian + 'IIII', raw)
+            if size > MAX_STREAM:
+                raise ValueError('パケットが大きすぎる')
+            frame = f.read(size)
+            if len(frame) != size:
+                raise ValueError('pcap のパケットが短い')
+            offset = {0: 4, 1: 14, 113: 16, 276: 20}[link]
+            if link == 1 and len(frame) >= 18 and frame[12:14] in (b'\x81\x00', b'\x88\xa8'):
+                offset += 4
+            ip = frame[offset:]
+            if not ip:
+                continue
+            if ip[0] >> 4 == 4:
+                ihl = (ip[0] & 15) * 4
+                if len(ip) < 20 or ip[9] != 6 or struct.unpack('!H', ip[6:8])[0] & 0x3fff:
+                    continue
+                length = struct.unpack('!H', ip[2:4])[0]
+                src, dst = str(ipaddress.ip_address(ip[12:16])), str(ipaddress.ip_address(ip[16:20]))
+                tcp = ip[ihl:length]
+            elif ip[0] >> 4 == 6 and len(ip) >= 40 and ip[6] == 6:
+                src, dst = str(ipaddress.ip_address(ip[8:24])), str(ipaddress.ip_address(ip[24:40]))
+                tcp = ip[40:40 + struct.unpack('!H', ip[4:6])[0]]
+            else:
+                continue
+            if len(tcp) < 20:
+                continue
+            sport, dport, seq = struct.unpack('!HHI', tcp[:8])
+            thl = (tcp[12] >> 4) * 4
+            if thl < 20 or len(tcp) < thl:
+                continue
+            yield (src, sport, dst, dport), seq, tcp[thl:], sec + fraction / scale, bool(tcp[13] & 2 and not tcp[13] & 16)
+
+
+def reassemble(segments):
+    """再送と重なりを除く。欠落の後をつなげて HTTP に見せない。"""
+    if not segments:
+        return b'', []
+    base = segments[0][0]
+    normalized = [(((seq - base + 2**31) % 2**32) - 2**31, data, t) for seq, data, t in segments]
+    normalized.sort(key=lambda v: v[0])
+    pos = normalized[0][0]; out = bytearray(); times = []
+    for seq, data, t in normalized:
+        if seq > pos:
+            break
+        data = data[max(0, pos - seq):]
+        if len(out) + len(data) > MAX_STREAM:
+            break
+        if data:
+            times.append((len(out), t)); out.extend(data); pos += len(data)
+    return bytes(out), times
+
+
+def messages(data, times, request_methods=None):
+    pos = 0
+    response_index = 0
+    while pos < len(data):
+        start = pos
+        end = data.find(b'\r\n\r\n', pos)
+        if end < 0:
+            return
+        lines = data[pos:end].decode('iso-8859-1').split('\r\n')
+        headers = {}
+        for line in lines[1:]:
+            k, sep, v = line.partition(':')
+            if sep:
+                headers[k.lower()] = v.strip()
+        first = lines[0]
+        if not re.match(r'(?:[A-Z]+ \S+ HTTP/1\.[01]|HTTP/1\.[01] \d{3})', first):
+            return
+        pos = end + 4
+        status = int(first.split()[1]) if first.startswith('HTTP/') else None
+        no_body = status is not None and (100 <= status < 200 or status in (204, 304) or (request_methods and response_index < len(request_methods) and request_methods[response_index] == 'HEAD'))
+        if no_body:
+            body = b''
+        elif headers.get('transfer-encoding', '').lower() == 'chunked':
+            body = bytearray()
+            while True:
+                end = data.find(b'\r\n', pos)
+                if end < 0:
+                    return
+                try:
+                    size = int(data[pos:end].split(b';')[0], 16)
+                except ValueError:
+                    return
+                pos = end + 2
+                if size == 0:
+                    if data[pos:pos+2] == b'\r\n':
+                        pos += 2
+                    else:
+                        trailers = data.find(b'\r\n\r\n', pos)
+                        if trailers < 0:
+                            return
+                        pos = trailers + 4
+                    break
+                if pos + size + 2 > len(data):
+                    return
+                body.extend(data[pos:pos+size]); pos += size + 2
+            body = bytes(body)
+        elif 'content-length' in headers:
+            try:
+                size = int(headers['content-length'])
+            except ValueError:
+                return
+            if size < 0 or pos + size > len(data):
+                return
+            body = data[pos:pos+size]; pos += size
+        elif first.startswith('HTTP/') and not re.match(r'HTTP/1\.[01] (?:1\d\d|204|304)', first):
+            body = data[pos:]; pos = len(data)
+        else:
+            body = b''
+        if headers.get('content-encoding', '').lower() == 'gzip':
+            try:
+                # 展開爆弾を避け、必要な分だけ読む。
+                import io
+                with gzip.GzipFile(fileobj=io.BytesIO(body)) as f:
+                    body = f.read(MAX_BODY + 1)
+            except (OSError, EOFError):
+                body = b''
+        timestamp = next((t for off, t in reversed(times) if off <= start), None)
+        if status is not None and status >= 200:
+            response_index += 1
+        yield {'first': first, 'headers': headers, 'body': body[:MAX_BODY].decode('utf-8', errors='replace'),
+               'body_truncated': len(body) > MAX_BODY, 'timestamp': timestamp}
+
+
+def pcap(path, out):
+    streams = collections.defaultdict(list)
+    # SYN ごとに世代を分け、同じ四つ組の接続再利用を混ぜない。
+    generations = collections.defaultdict(int)
+    syns = {}
+    for key, seq, data, t, syn in packets(path):
+        pair = tuple(sorted(((key[0], key[1]), (key[2], key[3]))))
+        if syn and syns.get(pair) != seq:
+            generations[pair] += 1
+            syns[pair] = seq
+        if data:
+            streams[(*key, generations[pair])].append((seq, data, t))
+    parsed = {}
+    for key, segments in streams.items():
+        data, times = reassemble(segments)
+        if not data.startswith(b'HTTP/'):
+            parsed[key] = list(messages(data, times))
+    rows = []
+    for key, requests in parsed.items():
+        if not requests or requests[0]['first'].startswith('HTTP/'):
+            continue
+        reverse = (key[2], key[3], key[0], key[1], key[4])
+        data, times = reassemble(streams.get(reverse, []))
+        responses = [m for m in messages(data, times, [r['first'].split()[0] for r in requests])
+                     if not re.match(r'HTTP/1\.[01] 1\d\d', m['first'])]
+        for i, request in enumerate(requests):
+            method, uri, protocol = request.pop('first').split(' ', 2)
+            response = responses[i] if i < len(responses) else None
+            rows.append({'time': request['timestamp'], 'method': method, 'uri': uri, 'protocol': protocol,
+                         'request': request, 'response': response, 'host': key[0]})
+    rows.sort(key=lambda r: r['time'] or 0)
+    Path(out).write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows))
+
+
+def flows(path, user_key, groups):
+    patterns = []
+    if groups and Path(groups).exists():
+        patterns = [re.compile(l.strip()) for l in Path(groups).read_text().splitlines() if l.strip() and not l.lstrip().startswith('#')]
+    users = collections.defaultdict(list)
+    import datetime
+    for line in Path(path).read_text().splitlines():
+        row = json.loads(line)
+        request = row.get('request', {})
+        headers = request.get('headers', {})
+        identity = row.get(user_key) or headers.get({'auth': 'authorization', 'cookie': 'cookie'}.get(user_key, user_key)) or row.get('connection') or row.get('host', 'unknown')
+        # 元の認証情報を出力しない。
+        user = hashlib.sha256(str(identity).encode()).hexdigest()[:16]
+        raw = row.get('msec') or row.get('time') or request.get('timestamp')
+        try:
+            t = float(raw)
+        except (ValueError, TypeError):
+            t = datetime.datetime.fromisoformat(raw).timestamp()
+        uri = row.get('uri', '').split('?', 1)[0]
+        uri = next((rx.pattern for rx in patterns if rx.search(uri)), uri)
+        users[user].append((t, row.get('method', '?'), uri))
+    routes = collections.Counter()
+    for user, events in sorted(users.items()):
+        events.sort(); start = events[0][0]; prev = start
+        print('user ' + user)
+        for t, method, uri in events:
+            print(f'  +{t-start:.3f}s 間隔 {t-prev:.3f}s {method} {uri}')
+            prev = t
+        routes[tuple((m, u) for _, m, u in events)] += 1
+    print('典型の動線')
+    for route, n in routes.most_common(10):
+        print(str(n) + ' users: ' + ' → '.join(m + ' ' + u for m, u in route))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__); sub = p.add_subparsers(dest='cmd', required=True)
+    f = sub.add_parser('flows'); f.add_argument('file'); f.add_argument('--user-key', default='cookie'); f.add_argument('--groups', default='conf/alp-groups.txt')
+    c = sub.add_parser('pcap'); c.add_argument('file'); c.add_argument('--out', required=True)
+    a = p.parse_args()
+    try:
+        if a.cmd == 'pcap': pcap(a.file, a.out)
+        else: flows(a.file, a.user_key, a.groups)
+        return 0
+    except (OSError, ValueError, struct.error) as e:
+        print(str(e), file=sys.stderr); return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

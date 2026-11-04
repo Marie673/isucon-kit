@@ -48,7 +48,7 @@ flags lint --ledger flags.md --code webapp/ --env servers/
 - `--pattern`: 名前の形の正規表現。既定は `[A-Z][A-Z0-9_]{3,}`。
 - `--ignore REGEX`（繰り返し可）: フラグではない設定を無視する（例: `--ignore '^DB_'`）。`PATH`・`HOME`・`RUST_LOG` などは既定で無視する（`--no-default-ignore` で外す）。台帳に載っている名前は無視されない。
 - `--exclude NAME`: 走査から外すディレクトリ名。`.git`・`node_modules`・`target`・`vendor` などは既定で外す。`.md` などコードでないものも読まない。
-- `--trial-hours N`: 試験中のままで許す時間（既定 3）。
+- `--trial-hours N`: 試験中のままで許す時間（既定 2）。
 - 問題があれば終了コード 1、無ければ 0。`--code` と `--env` は片方だけでもよい（無いほうの検査は飛ばす）。
 
 出す項目:
@@ -93,7 +93,7 @@ flags durability --conf hosts --conf webapp --decisions docs/DECISIONS.md
 ```
 
 - 追試（再起動後にデータが残る）に触れる設定は、`docs/DECISIONS.md` の記録と再起動試験が要る。
-- 入れるなら、人間の承認を取り、DECISIONS.md に設定の名前・理由・再起動試験の結果を書いてから反映する。名前が書かれていれば通る（中身が正しいかは見ない）。
+- 入れるなら、メインエージェントが決める。DECISIONS.md の「永続化を弱める設定」の表に設定・理由・危険・撤回の条件・再起動試験を書く。理由・危険・撤回の条件の空欄は通らない。反映前は試験が「未」でもよい。`durability --final` は成功した試験を要求する。
 - `isu-deploy` は、この道具があれば反映の前に流し、止まったら反映しない。
 - 設定ファイル・compose・SQL の行を正規表現で見る。`#`・`;`・`-- `・`//` で始まる行は読まない。`.md` は読まない。
 
@@ -135,7 +135,7 @@ cd tools/flags/tests/fixtures
 
 - `ISU_GO_FLAG` — 目的・根拠が空（台帳 9 行目）
 
-## 試験中のまま 3 時間を超えた（2）
+## 試験中のまま 2 時間を超えた（2）
 
 - `ISU_SIG_BATCH` — 試験中のまま 4.7 時間。採用か削除かを決める
 - `ISU_NODE_FLAG` — 試験中のまま 4.0 時間。採用か削除かを決める
@@ -184,3 +184,6 @@ cd tools/flags/tests/fixtures
 ```sh
 uv run python -m unittest discover -s tools/flags/tests
 ```
+
+台帳の既定は docs/flags.md があればそれを使う。
+probe も2時間の期限の対象にする。

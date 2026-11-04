@@ -13,3 +13,5 @@ tools/stop-rule/stop-rule --scores 584535,549096,548654,556170 --remaining 2 --l
 - スコアの一覧は、凍結の版（同じ commit）で測ったものだけを使う。版を変えたら一覧を作り直す。
 - 残りの本数は、締め切り（反映や接続を止める時刻）までの時間 ÷ 1 本の所要（待ち行列を含む）で数える。
 - マニュアルの最終スコアの決め方が「最高の点」や「平均」なら、この道具は要らない。
+
+テストは `uv run --no-project python -m unittest discover -s tools/stop-rule/tests`。

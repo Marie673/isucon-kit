@@ -5,8 +5,8 @@
 # ///
 """noise: スコアのぶれの幅を出し、2 群の差がぶれの中かどうかを判定する。
 
-同じ commit でも点は ±10% ぶれる。1 本ずつ比べて設定を切り替えると、ぶれを改善・悪化と取り違える。
-同じ条件を数本流して「ぶれの幅」を知り、差がそれより大きいときだけ良い・悪いと言う。
+同じ条件を数本流し、平均の差の95%信頼区間で比べる。
+1 本単位のぶれの幅も参考として出す。
 """
 from __future__ import annotations
 
@@ -232,6 +232,36 @@ def stats_of(vals: list[float]) -> Stats | None:
     return Stats(n, mean, sd, min(vals), max(vals))
 
 
+def t95(df: float) -> float:
+    """両側95%の t。表の自由度の間は保守的に線形補間する。"""
+    table = [(1, 12.706), (2, 4.303), (3, 3.182), (4, 2.776), (5, 2.571),
+             (6, 2.447), (7, 2.365), (8, 2.306), (9, 2.262), (10, 2.228),
+             (12, 2.179), (15, 2.131), (20, 2.086), (30, 2.042), (60, 2.000),
+             (120, 1.980), (1000000, 1.960)]
+    for (x, y), (xx, yy) in zip(table, table[1:]):
+        if df <= xx:
+            return y + (yy - y) * max(0, df - x) / (xx - x)
+    return 1.960
+
+
+def mean_interval(a: list[float], b: list[float], paired=False):
+    if paired:
+        if len(a) != len(b):
+            raise ValueError('--paired は同じ本数を時系列の順で渡す')
+        differences = [y - x for x, y in zip(a, b)]
+        st = stats_of(differences)
+        se, df, diff = (st.sd or 0) / math.sqrt(st.n), st.n - 1, st.mean
+    else:
+        sa, sb = stats_of(a), stats_of(b)
+        va, vb = (sa.sd or 0)**2 / sa.n, (sb.sd or 0)**2 / sb.n
+        se = math.sqrt(va + vb)
+        den = va**2 / (sa.n - 1) + vb**2 / (sb.n - 1)
+        df = (va + vb)**2 / den if den else math.inf
+        diff = sb.mean - sa.mean
+    margin = t95(df) * se
+    return diff - margin, diff + margin, df
+
+
 def fnum(x: float | None, vals_int: bool = True) -> str:
     if x is None:
         return "-"
@@ -305,8 +335,12 @@ def cmd_band(args, rows: list[Row]) -> int:
 
 
 def cmd_compare(args, rows: list[Row]) -> int:
+    if args.min_n < 2:
+        raise ValueError('--min-n は2以上にする')
     ca, fa, ua = select(rows, args.a, args.include_failed)
     cb, fb, ub = select(rows, args.b, args.include_failed)
+    if args.paired and (ua or ub or ((fa or fb) and not args.include_failed)):
+        raise ValueError('--paired は失格・未記録を除いた対を ids= で明示する。入力順の対応を変えない')
     sa, sb = stats_of([r.score for r in ca]), stats_of([r.score for r in cb])
     vi = all_int([r.score for r in ca + cb]) if (ca or cb) else True
     out = [f"# noise compare: A = {args.a} / B = {args.b}", ""]
@@ -329,7 +363,8 @@ def cmd_compare(args, rows: list[Row]) -> int:
         width = max(k * sdA, k * sdB, sa.span, sb.span)
         diff = sb.mean - sa.mean
         base = f"{k:g}σ（A {k * sdA:,.1f}、B {k * sdB:,.1f}）と範囲（A {fnum(sa.span, vi)}、B {fnum(sb.span, vi)}）の最大"
-        if abs(diff) <= width:
+        lo, hi, df = mean_interval([r.score for r in ca], [r.score for r in cb], args.paired)
+        if lo <= 0 <= hi:
             verdict, code = "差なし", EXIT_SAME
         else:
             good = (diff > 0) != args.lower_is_better
@@ -340,11 +375,12 @@ def cmd_compare(args, rows: list[Row]) -> int:
             [[f"{diff:+,.1f}", "-" if rel is None else f"{rel * 100:+.1f}%", f"{width:,.1f}",
               f"{abs(diff) / width:.2f}" if width else "∞"]],
             right_from=0))
-        out += ["", f"ぶれの幅 = {base}。", ""]
+        out += ["", f"平均の差の95%信頼区間: [{lo:+.2f}, {hi:+.2f}]（自由度 {df:.1f}）。",
+                f"参考: 1 本単位のぶれの幅 = {base}。", ""]
         out.append(f"**判定: {verdict}**" + {
-            "差なし": "（平均の差がぶれの幅以内。この差は同じ条件でも出る）",
-            "良い": "（平均の差がぶれの幅を超え、B のほうがよい向き）",
-            "悪い": "（平均の差がぶれの幅を超え、B のほうが悪い向き）",
+            "差なし": "（平均の差の95%信頼区間に0を含む。改善とも悪化とも決められない）",
+            "良い": "（平均の差の95%信頼区間が0を含まず、B のほうがよい向き）",
+            "悪い": "（平均の差の95%信頼区間が0を含まず、B のほうが悪い向き）",
         }[verdict])
         if min(sa.n, sb.n) < 3:
             out += ["", "- 注意: 2 本の群がある。標準偏差が不安定なので、幅は目安。可能なら 3 本以上"]
@@ -392,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    "素の語は label にあればそれ、無ければ commit の前方一致。")
     c.add_argument("a", metavar="A")
     c.add_argument("b", metavar="B")
+    c.add_argument("--paired", action="store_true", help="交互に流した同じ本数を入力順で対にする")
     c.add_argument("--k", type=float, default=2.0, help="ぶれの幅に使う σ の倍数（既定 2）")
     c.add_argument("--min-n", type=int, default=2, help="各群の最小本数（既定 2。これ未満は本数不足）")
     c.add_argument("--lower-is-better", action="store_true", help="小さいほど良い値（レイテンシなど）を比べるとき")

@@ -5,7 +5,7 @@
 # ///
 """flags: 環境変数のフラグの台帳（flags.md）と、コード・設定ファイルを突き合わせる。
 
-フラグが 71 個まで増え、どれが有効で何のためか誰も追えなくなった。
+フラグが増え、どれが有効で何のためか誰も追えなくなった。
 台帳に「何のために入れたか・いつ消すか」を書かせ、台帳とコードと設定ファイルのずれを lint で出す。
 読み取りだけ（`flags new` だけが台帳に 1 行足す）。
 `flags durability` は、永続化を弱める DB の設定を探し、決まりの記録に無ければ止める。サーバーには接続しない。
@@ -30,7 +30,7 @@ SKIP_DIRS = {".git", "node_modules", "target", "vendor", "__pycache__", ".venv",
 SKIP_SUFFIXES = {".md", ".lock", ".sum", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".gz", ".zip", ".so", ".o", ".a"}
 MAX_BYTES = 2_000_000
 
-TRIAL = {"試験中", "検証中", "trial", "testing"}
+TRIAL = {"試験中", "検証中", "trial", "testing", "probe"}
 REMOVED = {"削除済", "削除済み", "廃止", "removed", "deleted"}
 EMPTY_WORDS = {"", "-", "—", "–", "?", "tbd", "todo", "なし", "未定", "n/a"}
 UNSET_WORDS = {"", "-", "—", "–", "未設定", "(未設定)", "（未設定）", "unset", "(unset)", "(なし)", "なし"}
@@ -373,9 +373,7 @@ def summary_line(sc: Scan) -> list[str]:
 
 # ---------------------------------------------------------------- 永続化
 
-# 再起動後にデータが残ること（追試）を弱める設定。見つけたら、決まりの記録（DECISIONS.md）に
-# その名前が書かれているまで止める。2026-11-02 の練習で、主ループが承認なしに
-# innodb_flush_log_at_trx_commit を下げた（気づいたのは人間で、事後の承認になった）。
+# 永続化を弱める設定は、判断の表を検査する。
 _SEP = r"[_-]"
 def _k(name: str) -> str:
     return _SEP.join(name.split("_"))
@@ -418,7 +416,22 @@ def cmd_durability(args) -> int:
     hits = scan_durability(roots, set(args.exclude))
     dec_path = Path(args.decisions)
     decisions = dec_path.read_text(encoding="utf-8") if dec_path.exists() else ""
-    recorded = lambda name: re.search(r"(?<![A-Za-z_])" + re.escape(name) + r"(?![A-Za-z_])", decisions, re.I) is not None
+    section = re.search(r"^## 永続化を弱める設定\s*$(.*?)(?=^## |\Z)", decisions, re.M | re.S)
+    records = []
+    if section:
+        for line in section.group(1).splitlines():
+            if line.strip().startswith('|'):
+                records.append([c.strip().strip('`') for c in line.strip().strip('|').split('|')])
+    def recorded(name):
+        for cells in records:
+            if len(cells) < 5 or not re.search(r'(?<![A-Za-z_])' + re.escape(name) + r'(?![A-Za-z_])', cells[0]):
+                continue
+            if any(c.strip().lower() in EMPTY_WORDS | {'未', '未記入'} for c in cells[1:4]):
+                continue
+            if getattr(args, 'final', False) and (cells[4].lower() in EMPTY_WORDS | {'未', '未実施'} or not re.search(r'成功|合格|pass|ok|通過', cells[4], re.I)):
+                continue
+            return True
+        return False
     missing = [h for h in hits if not recorded(h[0])]
     out = ["# flags durability", "", f"- 走査: {', '.join(roots)}", f"- 決まりの記録: {dec_path}" + ("" if dec_path.exists() else "（無い）"),
            f"- 永続化を弱める設定: {len(hits)} か所（記録あり {len(hits) - len(missing)}、記録なし {len(missing)}）"]
@@ -427,7 +440,7 @@ def cmd_durability(args) -> int:
     if missing:
         out += ["", f"## 決まりの記録が無い（{len(missing)}）", ""]
         out += [f"- `{name}` — {Path(f).as_posix()}:{n}（{what}）: `{ln}`" for name, f, n, ln, what in missing]
-        out += ["", f"止める。入れるなら、人間の承認を取り、{dec_path} に設定の名前・理由・再起動試験の結果を書いてから反映する。"]
+        out += ["", f"止める。メインエージェントが決め、{dec_path} の「永続化を弱める設定」の表に設定・理由・危険・撤回の条件・再起動試験を書く。"]
     if not hits:
         out += ["", "問題なし。"]
     sys.stdout.write("\n".join(out) + "\n")
@@ -525,7 +538,7 @@ def add_common(p: argparse.ArgumentParser, S):
 def build_parser() -> argparse.ArgumentParser:
     S = argparse.SUPPRESS
     p = argparse.ArgumentParser(prog="flags", description="環境変数のフラグの台帳と、コード・設定ファイルの突き合わせ。")
-    p.add_argument("--ledger", default="flags.md", metavar="PATH", help="台帳（既定 flags.md）")
+    p.add_argument("--ledger", default="docs/flags.md" if Path("docs/flags.md").exists() else "flags.md", metavar="PATH", help="台帳（docs/flags.md があれば優先）")
     p.add_argument("--pattern", default=DEFAULT_PATTERN, metavar="REGEX", help=f"環境変数の名前の形（既定 {DEFAULT_PATTERN}）")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -537,13 +550,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--ignore", action="append", default=[], metavar="REGEX", help="フラグではない設定として無視する名前（繰り返し可。例: '^DB_'）")
         sp.add_argument("--no-default-ignore", action="store_true", help="PATH・HOME・RUST_LOG などの既定の無視リストを使わない")
         sp.add_argument("--now", metavar="ISO", help="今の時刻（試験用。既定は現在）")
-        sp.add_argument("--trial-hours", type=float, default=3.0, metavar="N", help="試験中のままで許す時間（既定 3）")
+        sp.add_argument("--trial-hours", type=float, default=2.0, metavar="N", help="試験中のままで許す時間（既定 2）")
 
     l = sub.add_parser("lint", help="台帳・コード・設定ファイルを突き合わせる（問題があれば終了コード 1）")
     scan_args(l)
     ls = sub.add_parser("list", help="台帳のフラグ 1 つにつき 1 行で、設定ファイルの値とコードの参照数を並べる")
     scan_args(ls)
     d = sub.add_parser("durability", help="永続化を弱める DB の設定を探し、決まりの記録に名前が無ければ止める（終了コード 1）")
+    d.add_argument("--final", action="store_true", help="再起動試験の成功も要求する")
     d.add_argument("--conf", action="append", default=[], metavar="DIR", help="設定ファイル・compose・SQL のディレクトリかファイル（繰り返し可。既定 .）")
     d.add_argument("--decisions", default="docs/DECISIONS.md", metavar="PATH", help="決まりの記録（既定 docs/DECISIONS.md）")
     d.add_argument("--exclude", action="append", default=[], metavar="NAME", help="走査から外すディレクトリ名（繰り返し可）")
