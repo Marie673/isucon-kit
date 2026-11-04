@@ -45,11 +45,11 @@ bin/isu-export-seed webapp/rust-mem/seed           # initialize 直後の初期�
 - `hosts/<host>/etc/systemd/system/isu-mem.service` を置く（templates/inmemory-rust/isu-mem.service）。`systemctl enable` は deploy 後に1度だけ（`bin/isu-ssh <host> sudo systemctl enable isu-mem` — 例外的に許可）
 - 旧アプリは `disable` するが消さない（ロールバック用）。nginx の upstream を新サーバのポートへ
 - 台を減らすなら、使わない台のサービスを止める。DB を使わないなら ISU_DB_HOST を空に（slow log を取らない）
-- `bin/isu-golden check` → `bin/isu-bench --note "rewrite cutover"`
+- `bin/isu-golden check` → `bin/isu-bench start --note "rewrite cutover"`
 
 ## 5. 追試対策（切り替えたら必ず）
 
-- `bin/isu-reboot-test --yes` → `bin/isu-bench --no-deploy` でスコアが再現し、ベンチ前に書かれたデータが残ることを確認
+- `bin/isu-reboot-test --yes` → `bin/isu-bench start --no-deploy --note "再起動後の確認"` でスコアが再現し、ベンチ前に書かれたデータが残ることを確認
 - delta は `/home/isucon/state/`（`/tmp` は再起動で消える）
 - SIGTERM で flush（テンプレートが実装済み）。`TimeoutStopSec` 内に終わること
 - MySQL を使わなくなったら `disable` し、起動していないことを確認（無駄なメモリと I/O を消す）

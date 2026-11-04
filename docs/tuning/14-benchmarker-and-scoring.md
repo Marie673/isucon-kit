@@ -381,7 +381,7 @@ ISUCON 公式の講評・結果
 
 - 、`isucon-kit/docs/strategy.md`、`isucon-kit/tools/noise/README.md`
 
-## 出典未確認の項目（後で人間が確かめる）
+## 出典未確認の項目（使う前に原文で確かめる）
 
 - ISUCON12 本選・ISUCON13 の減点・FAIL・負荷の増え方は、当日マニュアルの全文を取得しておらず、講評と一部の節だけで書いた。
 - ISUCON12 本選のスコアの式、ISUCON10 予選の最終スコアの決め方は、取得した資料に記述が無い。

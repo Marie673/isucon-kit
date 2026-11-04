@@ -40,7 +40,7 @@ description: 仕様の振る舞い（何を返せばスコアになるか、初�
 5. 新しい利用者の動線（登録から最初の点まで）と、その所要時間を出す。
 
 ### 3. リクエストの特性（10 分）
-- `tools/bench-window` でピークの窓と窓の外に分け、3 節の表を埋める。
+- `tools/bench-window/bench-window` でピークの窓と窓の外に分け、3 節の表を埋める。
 - 熱いデータの大きさを見積もる（メモリに載るか）。
 - 区分をまたぐ読みの割合は、思い込まずに測る。
 
@@ -59,3 +59,10 @@ description: 仕様の振る舞い（何を返せばスコアになるか、初�
 - ピークの大きさ（同時の人数・処理）を `docs/design.md` の D3 に渡す。
 - 6 節の問いを `probe-experiments` に渡す。
 - `docs/design.md` の A のボーナスの条件と、5 節の選べる値を、作戦ボード（`docs/README.md`）のボトルネック表の候補に載せる。
+
+## 通信を読む道具
+
+`bin/isu-bench start --note "動線を読む" --capture` で上限つきの平文通信を取る。
+`tools/capture/capture pcap results/<id>/<host>/capture.pcap --out results/<id>/<host>/http.jsonl` で対にする。
+`tools/capture/capture flows results/<id>/<host>/http.jsonl --user-key cookie --groups conf/alp-groups.txt` で時系列を読む。
+認証情報を要約へ写さない。生のログと pcap はコミットしない。

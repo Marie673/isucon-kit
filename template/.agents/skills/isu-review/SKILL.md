@@ -17,7 +17,7 @@ description: 別モデルレビュー（smart-friend）。Claude の設計や差
 ## 使い方
 
 ```sh
-bin/isu-review plan docs/plan-xxx.md     # 実装前の設計（ファイル）
+bin/isu-review plan docs/DECISIONS.md     # 実装前の設計（ファイル）
 echo "<設計>" | bin/isu-review plan -     # 標準入力でも可
 bin/isu-review diff                      # main...HEAD の差分
 bin/isu-review diff <base> --with claude # レビュアーを明示

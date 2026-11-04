@@ -271,7 +271,7 @@
 - **危険**:
   - **間隔を延ばしすぎると、間欠的に失敗する**（Iceman）。満足度の評価が下がる（講評）。
   - **ルールを確認する**。仕様（マニュアル）が許している範囲だけ。ISUCON14 は `retry_after_ms` が仕様で、マッチングの間隔（`ISUCON_MATCHING_INTERVAL`）と `isuride-matcher` の仕様変更も、マニュアルが「自由に利用方法及び仕様を変更して構いません」と書いている。
-  - **意図的な遅延で利用者の次の行動を変える手は別物**。応答を留めて次の行動を変える型は、グレーで、採用の前に人間の判断を取る。503 で逃げない。全員に同じ規則で、返す中身はその時点の正しい状態、が最低条件。
+  - **意図的な遅延で利用者の次の行動を変える手は別物**。応答を留めて次の行動を変える型は、グレーで、採用の前に仕様と失格の条件を確かめ、メインエージェントが根拠を記録して決める。503 で逃げない。全員に同じ規則で、返す中身はその時点の正しい状態、が最低条件。
   - 反映の猶予を超えると critical になる。
 - **出典**: [ISUCON14 講評](https://isucon.net/archives/58869617.html)、[ISUCON14 アプリケーションマニュアル](https://github.com/isucon/isucon14/blob/main/docs/ISURIDE.md)、[ISUCON11 予選講評](https://isucon.net/archives/56044867.html)、[ISUCON9 予選講評](https://isucon.net/archives/53789931.html)、[Iceman（ISUCON14）](https://zenn.dev/iceman/articles/1780deef84eda8)、[LayerX（ISUCON14）](https://zenn.dev/layerx/articles/3bd55b77e047c4)、[3 位のチーム（モヒカンメモ）](https://blog.pinkumohikan.com/entry/isucon-14)。
 

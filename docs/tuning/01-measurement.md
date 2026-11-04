@@ -805,7 +805,7 @@ ISUCON 公式の講評・マニュアル
 
 手元の資料
 
-- `isucon-kit/tools/bench-window/README.md`、`isucon-kit/tools/noise/README.md`、## 出典未確認の項目（後で人間が確かめる）
+- `isucon-kit/tools/bench-window/README.md`、`isucon-kit/tools/noise/README.md`、## 出典未確認の項目（使う前に原文で確かめる）
 
 - alp の `-m` に複数の正規表現をまとめて渡す書き方、`kataribe.toml` の設定項目。
 - MySQL の `FLUSH SLOW LOGS` によるローテートの手順（slow log のページに無い）。
