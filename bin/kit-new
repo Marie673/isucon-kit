@@ -47,7 +47,7 @@ def main():
         if not (dst / '.git').exists():
             subprocess.run(['git', '-C', dst, 'init', '-q', '-b', 'main'], check=True)
     for src in sorted((here / 'template').rglob('*')):
-        if not src.is_file() or '.DS_Store' in src.parts or 'tests' in src.parts or '__pycache__' in src.parts:
+        if not src.is_file() or '.DS_Store' in src.parts or 'tests' in src.parts or '__pycache__' in src.parts or 'target' in src.parts:
             continue
         rel = src.relative_to(here / 'template')
         managed_file = str(rel) == 'AGENTS.md' or rel.parts[0] in ('bin', '.agents')
@@ -97,7 +97,7 @@ def main():
             settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
         ownership.write_text(json.dumps(sorted(expected), ensure_ascii=False, indent=2) + '\n')
     print('展開しました: ' + str(dst))
-    print('次: isu.env → docs/RULES.md → bin/isu-doctor → skill isu-kickoff')
+    print('次: IP・時刻・鍵を埋める → isu-doctor --bootstrap → isu-keys → setup → backup → inventory → isu.env を揃える → import → doctor（skill isu-kickoff）')
 
 if __name__ == '__main__':
     main()

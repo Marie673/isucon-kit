@@ -43,8 +43,8 @@ Chrome の道具が無ければ、人間が押して finish に合否と値を�
 ```sh
 bin/kit-new <競技リポジトリ>
 # isu.env と docs/RULES.md を埋める。
-# 競技リポジトリの main で bin/isu-doctor を実行する。
-# skill isu-kickoff → main-loop を使う。
+# 競技リポジトリの main で bin/isu-doctor --bootstrap を実行する。
+# skill isu-kickoff の順に keys → setup → backup → inventory → 設定 → import → doctor を進める。
 ```
 
 既定では既存ファイルを上書きしない。

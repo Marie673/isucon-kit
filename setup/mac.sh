@@ -16,7 +16,7 @@ for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
 done
 ok "rust targets: $(rustup target list --installed | tr '\n' ' ')"
 
-for c in gh gwq herdr claude codex go; do
+for c in uv gh gwq herdr claude codex go; do
   command -v "$c" >/dev/null && ok "$c" || warn "$c がありません"
 done
 

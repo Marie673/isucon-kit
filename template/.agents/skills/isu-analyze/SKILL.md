@@ -6,6 +6,8 @@ description: 計測から次のボトルネックを探す。「結果を分析�
 # 計測を読む
 
 `results/<id>/SUMMARY.md`、`portal.txt` と作戦ボードを読む。
+最初に SUMMARY の窓内の CPU 表とプロセス別 CPU を読む。
+次に alp・DB・perf・アプリログを照らす。
 スコアの式の項ごとに取りこぼしを数える。
 `tools/bench-window/bench-window <host>=results/<id>/<host>/access.log` で詰まった窓を見る。
 利用者の動きは `tools/capture/capture flows <ログ> --user-key cookie` で読む。

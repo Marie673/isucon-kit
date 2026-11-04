@@ -9,3 +9,4 @@ __pycache__/
 /tests/latest-test.log
 /tests/tmp*/
 /template/templates/inmemory-rust/target/
+/tests/linux-work/

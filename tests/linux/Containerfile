@@ -1,0 +1,5 @@
+FROM docker.io/library/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y systemd systemd-sysv openssh-server sudo nginx mysql-server sysstat percona-toolkit curl jq tcpdump linux-tools-common ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash isucon && echo 'isucon ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/isucon && chmod 440 /etc/sudoers.d/isucon && ssh-keygen -A && systemctl enable ssh nginx mysql && mkdir -p /run/sshd
+CMD ["/sbin/init"]

@@ -42,7 +42,7 @@ bin/isu-export-seed webapp/rust-mem/seed           # initialize 直後の初期�
 ## 4. 切り替え（単独ベンチ）
 
 - isu.env: `ISU_LANG=rust`、`ISU_SRC_DIR=webapp/rust-mem`、`ISU_BIN_NAME=isu-mem`、`ISU_REMOTE_BIN=/home/isucon/webapp/rust-mem/isu-mem`、`ISU_SERVICES_<host>="isu-mem.service"`、`ISU_DEPLOY_PATHS="webapp/rust-mem/seed"`
-- `hosts/<host>/etc/systemd/system/isu-mem.service` を置く（templates/inmemory-rust/isu-mem.service）。`systemctl enable` は deploy 後に1度だけ（`bin/isu-ssh <host> sudo systemctl enable isu-mem` — 例外的に許可）
+- `hosts/<host>/etc/systemd/system/isu-mem.service` を置く（templates/inmemory-rust/isu-mem.service）。enable と起動は `bin/isu-deploy` に任せる。
 - 旧アプリは `disable` するが消さない（ロールバック用）。nginx の upstream を新サーバのポートへ
 - 台を減らすなら、使わない台のサービスを止める。DB を使わないなら ISU_DB_HOST を空に（slow log を取らない）
 - `bin/isu-golden check` → `bin/isu-bench start --note "rewrite cutover"`
