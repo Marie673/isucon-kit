@@ -22,6 +22,8 @@ import subprocess as sp
 import sys
 import tarfile
 import time
+import tempfile
+from isu_summary import cpu_table, processes, profile, journal_counts, timezone, sample_time
 
 Q = shlex.quote
 
@@ -77,14 +79,27 @@ class Kit:
         self.token = os.environ.get('ISU_LOCK_TOKEN', '')
         self.results = self.main / 'results'
         self.config = self.state / 'ssh_config'
+        self.gen_ssh_config()
+
+    def gen_ssh_config(self):
         lines = []
         for h in self.hosts():
             lines += [f'Host {h}', f'  HostName {self.get("ISU_IP_" + h)}',
-                      f'  User {self.get("ISU_SSH_USER", "isucon")}', f'  IdentityFile {self.get("ISU_SSH_KEY")}']
-        lines += ['Host *', '  StrictHostKeyChecking accept-new', f'  UserKnownHostsFile {self.state}/known_hosts',
+                      f'  User {self.get("ISU_SSH_USER", "isucon")}', f'  Port {self.get("ISU_SSH_PORT_" + h, "22")}', f'  IdentityFile {self.get("ISU_SSH_KEY")}']
+        lines += ['Host *', '  IdentitiesOnly yes', '  LogLevel ERROR', '  StrictHostKeyChecking accept-new', f'  UserKnownHostsFile {self.state}/known_hosts',
                   '  ControlMaster auto', '  ControlPath ~/.ssh/cm-isu-%C', '  ControlPersist 60s',
                   '  ConnectTimeout 10', '  ServerAliveInterval 15']
-        self.config.write_text('\n'.join(lines) + '\n')
+        content = '\n'.join(lines) + '\n'
+        if self.config.exists() and self.config.read_text() == content:
+            return
+        fd, name = tempfile.mkstemp(dir=self.state, prefix='ssh-config-')
+        try:
+            with os.fdopen(fd, 'w') as file:
+                file.write(content)
+            os.replace(name, self.config)
+        finally:
+            if Path(name).exists():
+                Path(name).unlink()
 
     def get(self, key, default=''):
         return self.env.get(key, default)
@@ -112,7 +127,7 @@ class Kit:
         if not host or not self.get('ISU_IP_' + host):
             fail(f'ホストの IP がありません: {host}')
         p = sp.run(['ssh', '-F', str(self.config), *([] if data is not None else ['-n']), host, command],
-                   input=data, stdout=sp.PIPE, text=not binary, timeout=self.connection_timeout())
+                   input=data, stdout=sp.PIPE, text=not binary, **({} if binary else {'errors': 'replace'}), timeout=self.connection_timeout())
         if check and p.returncode:
             fail(f'{host}: ssh が失敗しました ({p.returncode}): {command}')
         return p
@@ -147,6 +162,20 @@ class Kit:
             fail('ロックのトークンが一致しません')
         self.ssh(self.get('ISU_LOCK_HOST'), f'rm -rf -- {Q(self.lockdir)}')
 
+    def force_release(self):
+        self.canonical()
+        self.ssh(self.get('ISU_LOCK_HOST'), 'rm -rf -- ' + Q(self.lockdir))
+        path = self.state / 'bench-current'
+        if path.exists():
+            current = json.loads(path.read_text())
+            meta_path = self.results / current['id'] / 'meta.env'
+            meta = read_meta(meta_path)
+            meta.update(STATE='aborted', RESULT='fail', ABORT_REASON='lock force-release')
+            write_meta(meta_path, meta)
+            self.summarize(current['id']); self.scoreboard()
+            path.unlink()
+            warn('残った計測の停止と回収: bin/isu-measure stop ' + current['id'])
+
     def code_sha(self):
         sha = output(['git', 'log', '-1', '--format=%h', '--', '.', ':!results', ':!docs'])
         if not sha:
@@ -155,8 +184,10 @@ class Kit:
         return sha + ('-dirty' if dirty else '')
 
     def commit(self, msg, paths):
-        merge = output(['git', '-C', self.main, 'rev-parse', '--git-path', 'MERGE_HEAD'])
+        merge = output(['git', '-C', self.main, 'rev-parse', '--path-format=absolute', '--git-path', 'MERGE_HEAD'])
         pending = self.state / 'commit-pending.json'
+        if pending.exists():
+            paths = list(dict.fromkeys([*json.loads(pending.read_text())['paths'], *paths]))
         if Path(merge).exists():
             warn('マージ中です。記録を残しました。isu-score --regen の後で再コミットしてください')
             pending.write_text(json.dumps({'message': msg, 'paths': paths}, ensure_ascii=False))
@@ -285,6 +316,8 @@ HOME_DIR=$1; services=$2; sha=$3; kind=$4
 stage=$HOME_DIR/.isu-stage
 binary=$5
 db_restart=$6
+is_db_host=$7
+db_service=$8
 old=$HOME_DIR/.isu-manifest
 changed_db=0
 changed_sysctl=0
@@ -313,23 +346,26 @@ while IFS=$'\t' read -r path hash; do
     sudo chmod +x "$path.new"
     sudo mv -f "$path.new" "$path"
   elif [ -e "$path" ]; then sudo sh -c 'cat "$1" > "$2"' sh "$stage/${path#/}" "$path"
-  else sudo cp -p "$stage/${path#/}" "$path"; fi
+  else
+    sudo cp -p "$stage/${path#/}" "$path"
+    case "$path" in /etc/*) sudo chown root:root "$path";; esac
+  fi
 done < "$stage/manifest.new"
 restart() {
   if ! sudo systemctl restart "$@"; then sudo journalctl -n 50 --no-pager >&2; exit 1; fi
 }
 sudo systemctl daemon-reload
 if [ "$changed_sysctl" = 1 ]; then sudo sysctl --system; fi
-if [ "$changed_db" = 1 ]; then
+if [ "$changed_db" = 1 ] && [ "$is_db_host" = 1 ] && systemctl is-enabled "$db_service" >/dev/null 2>&1; then
   case "$kind" in mysql|postgresql)
     if ! bash -c "$db_restart"; then sudo journalctl -n 50 --no-pager >&2; exit 1; fi;; esac
 fi
-if command -v nginx >/dev/null; then sudo nginx -t; sudo systemctl reload nginx; fi
+if systemctl is-active --quiet nginx; then sudo nginx -t; sudo systemctl reload nginx; fi
 for s in $services; do sudo systemctl enable "$s"; restart "$s"; sudo systemctl is-active --quiet "$s"; done
 cp "$stage/manifest.new" "$old"
 rm -rf -- "$stage"
 '''
-                self.script(h, script, self.home, self.get('ISU_SERVICES_' + h), sha, self.get('ISU_DB_KIND'), self.get('ISU_REMOTE_BIN'), self.db_restart())
+                self.script(h, script, self.home, self.get('ISU_SERVICES_' + h), sha, self.get('ISU_DB_KIND'), self.get('ISU_REMOTE_BIN'), self.db_restart(), int(h == self.get('ISU_DB_HOST')), 'docker' if 'docker' in self.get('ISU_DB_CMD') else self.get('ISU_DB_KIND'))
             self.health()
             for h in (a.hosts.split() if a.hosts else self.hosts()):
                 if h in self.hosts():
@@ -339,7 +375,7 @@ rm -rf -- "$stage"
                 self.release()
         print('deployed ' + sha, file=sys.stderr)
 
-    def measure(self, action, id, capture=False):
+    def measure(self, action, id, capture=False, best_effort=False):
         r = self.results / id
         r.mkdir(parents=True, exist_ok=True)
         if action == 'wait':
@@ -361,70 +397,94 @@ rm -rf -- "$stage"
                 time.sleep(1)
             fail('流量待ちが時間切れです。ポータルで確認してください')
         for h in self.hosts():
-            m = self.home + '/.isu-measure'
-            app = h in self.get('ISU_APP_HOSTS').split()
-            nginx = h == self.get('ISU_NGINX_HOST')
-            dbhost = h == self.get('ISU_DB_HOST') and self.get('ISU_DB_KIND') != 'none'
-            if action == 'start':
-                script = f'set -euo pipefail\nrm -rf -- {Q(m)}\nmkdir -p {Q(m)}\ndate +%s > {Q(m)}/t_start\n'
-                if nginx:
-                    script += f'sudo truncate -s0 {Q(self.get("ISU_ACCESS_LOG"))}\n'
-                if dbhost:
-                    if self.get('ISU_DB_KIND') == 'mysql':
-                        script += f'{self.get("ISU_DB_CMD", "sudo")} truncate -s0 {Q(self.get("ISU_SLOW_LOG"))}\n' + self.db('SET GLOBAL slow_query_log=ON') + '\n'
-                    elif self.get('ISU_DB_KIND') == 'postgresql':
-                        script += self.db('SELECT pg_stat_statements_reset()') + '\n'
-                for name, command in [('vmstat', 'vmstat -n -t 1'), ('pidstat', 'pidstat -u -h 1')]:
-                    script += f'nohup timeout 1800 {command} > {Q(m)}/{name}.log 2>&1 < /dev/null &\necho $! > {Q(m)}/{name}.pid\n'
-                if app:
-                    script += f'nohup sudo timeout -s INT 1800 perf record -F 99 -a -g -o {Q(m)}/perf.data > {Q(m)}/perf.out 2>&1 < /dev/null &\necho $! > {Q(m)}/perf.pid\n'
-                    if self.get('ISU_PPROF_URL'):
-                        url = self.get('ISU_PPROF_URL') + ('&' if '?' in self.get('ISU_PPROF_URL') else '?') + 'seconds=' + self.get('ISU_PPROF_SECONDS', '60')
-                        script += f'nohup timeout 1800 curl -fsS -o {Q(m)}/cpu.pprof {Q(url)} > {Q(m)}/pprof.out 2>&1 < /dev/null &\necho $! > {Q(m)}/pprof.pid\n'
-                    if capture:
-                        port = self.get('ISU_APP_PORT')
-                        if not port.isdigit():
-                            fail('capture には ISU_APP_PORT が必要です')
-                        script += f'nohup sudo timeout -s INT 300 tcpdump -Z root -i any -s 0 -U -C 16 -W 2 -w {Q(m)}/capture.pcap "tcp port {port}" > {Q(m)}/tcpdump.log 2>&1 < /dev/null &\necho $! > {Q(m)}/capture.pid\n'
-                        script += f'for i in $(seq 50); do [ ! -s {Q(m)}/capture.pcap0 ] && [ ! -s {Q(m)}/capture.pcap ] || break; sleep 0.1; done\n'
-                        script += f'[ -s {Q(m)}/capture.pcap0 ] || [ -s {Q(m)}/capture.pcap ] || {{ cat {Q(m)}/tcpdump.log >&2; exit 1; }}\n'
-                self.script(h, script)
-            elif action == 'stop':
-                script = f'''set -euo pipefail
-M={Q(m)}
-mkdir -p "$M"
-for f in "$M"/*.pid; do
-  [ -f "$f" ] || continue
-  sudo kill -INT "$(cat "$f")" 2>/dev/null || true
-  # timeout が子を回収してファイルを閉じるまで待つ。
-  for i in $(seq 100); do sudo kill -0 "$(cat "$f")" 2>/dev/null || break; sleep 0.1; done
-  if sudo kill -0 "$(cat "$f")" 2>/dev/null; then echo "計測を停止できません: $f" >&2; exit 1; fi
-  rm -f "$f"
-done
-'''
-                if dbhost:
-                    if self.get('ISU_DB_KIND') == 'mysql':
-                        script += self.db('SET GLOBAL slow_query_log=OFF') + '\n'
-                        script += f'{self.get("ISU_DB_CMD", "sudo")} cat {Q(self.get("ISU_SLOW_LOG"))} > "$M/slow.log"\n'
-                        script += 'pt-query-digest --limit 30 "$M/slow.log" > "$M/slow.txt"\n'
-                    elif self.get('ISU_DB_KIND') == 'postgresql':
-                        script += self.db('SELECT query, calls, total_exec_time, rows FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 30') + ' > "$M/pg-stat-statements.txt"\n'
-                if nginx:
-                    groups = self.root / 'conf/alp-groups.txt'
-                    patterns = [l.strip() for l in groups.read_text().splitlines() if l.strip() and not l.lstrip().startswith('#')] if groups.exists() else []
-                    group_arg = ' -m ' + Q(','.join(patterns)) if patterns else ''
-                    script += f'sudo cp {Q(self.get("ISU_ACCESS_LOG"))} "$M/access.log"\nsudo chmod a+r "$M/access.log"\n'
-                    script += f'sudo alp json --file "$M/access.log" --sort sum -r{group_arg} > "$M/alp.txt"\n'
-                if app:
-                    script += 'if [ -s "$M/perf.data" ]; then sudo perf report -i "$M/perf.data" --stdio > "$M/perf.txt"; fi\n'
-                    for svc in self.get('ISU_SERVICES_' + h).split():
-                        script += f'sudo journalctl -u {Q(svc)} --since "@$(cat "$M/t_start")" -n 100 --no-pager >> "$M/journal.txt"\n'
-                script += 'if [ -f "$M/capture.pcap0" ]; then mv "$M/capture.pcap0" "$M/capture.pcap"; fi\n'
-                script += 'COPYFILE_DISABLE=1 tar -C "$M" --exclude=perf.data --exclude=perf.out -czf - .\n'
-                p = self.script(h, script, binary=True)
-                dest = r / h; dest.mkdir(exist_ok=True)
-                with tarfile.open(fileobj=io.BytesIO(p.stdout), mode='r:gz') as tar:
-                    tar.extractall(dest, filter='data')
+            try:
+                m = self.home + '/.isu-measure'
+                app = h in self.get('ISU_APP_HOSTS').split()
+                nginx = h == self.get('ISU_NGINX_HOST')
+                dbhost = h == self.get('ISU_DB_HOST') and self.get('ISU_DB_KIND') != 'none'
+                if action == 'start':
+                    script = f'set -euo pipefail\nexport LC_ALL=C S_TIME_FORMAT=ISO TZ=UTC\nrm -rf -- {Q(m)}\nmkdir -p {Q(m)}\ndate +%s > {Q(m)}/t_start\ndate +%z > {Q(m)}/tz-offset\n'
+                    if nginx:
+                        script += f'sudo truncate -s0 {Q(self.get("ISU_ACCESS_LOG"))}\n'
+                    if dbhost:
+                        if self.get('ISU_DB_KIND') == 'mysql':
+                            script += f'{self.get("ISU_DB_CMD", "sudo")} truncate -s0 {Q(self.get("ISU_SLOW_LOG"))}\n' + self.db('SET GLOBAL slow_query_log=ON') + '\n'
+                        elif self.get('ISU_DB_KIND') == 'postgresql':
+                            script += self.db('SELECT pg_stat_statements_reset()') + '\n'
+                    for name, command in [('vmstat', 'vmstat -n -t 1'), ('pidstat', 'pidstat -H -u -h 1')]:
+                        script += f'nohup timeout 1800 stdbuf -oL {command} > {Q(m)}/{name}.log 2>&1 < /dev/null &\necho $! > {Q(m)}/{name}.pid\n'
+                    if app:
+                        script += f'nohup sudo timeout -s INT 1800 perf record -F 99 -a -g -o {Q(m)}/perf.data > {Q(m)}/perf.out 2>&1 < /dev/null &\necho $! > {Q(m)}/perf.pid\n'
+                        if self.get('ISU_PPROF_URL'):
+                            url = self.get('ISU_PPROF_URL') + ('&' if '?' in self.get('ISU_PPROF_URL') else '?') + 'seconds=' + self.get('ISU_PPROF_SECONDS', '60')
+                            script += f'nohup timeout 1800 curl -fsS -o {Q(m)}/cpu.pprof {Q(url)} > {Q(m)}/pprof.out 2>&1 < /dev/null &\necho $! > {Q(m)}/pprof.pid\n'
+                        if capture:
+                            port = self.get('ISU_APP_PORT')
+                            if not port.isdigit():
+                                fail('capture には ISU_APP_PORT が必要です')
+                            mb = int(self.get('ISU_CAPTURE_MB', '1024'))
+                            seconds = int(self.get('ISU_CAPTURE_SECS', '300'))
+                            if mb <= 0 or seconds <= 0:
+                                fail('ISU_CAPTURE_MB/SECS は正の数にしてください')
+                            # RLIMIT_FSIZE は書き込み時に止める。ファイルを回して上書きしない。
+                            inner = 'ulimit -f "$1"; exec tcpdump -Z root -i any -s 0 -U -w "$2" "tcp port $3"'
+                            script += f'nohup sudo timeout -s INT {seconds} bash -c {Q(inner)} bash {mb * 1024} {Q(m)}/capture.pcap {port} > {Q(m)}/tcpdump.log 2>&1 < /dev/null &\necho $! > {Q(m)}/capture.pid\n'
+                            script += f'for i in $(seq 50); do [ ! -s {Q(m)}/capture.pcap ] || break; sleep 0.1; done\n'
+                            script += f'[ -s {Q(m)}/capture.pcap ] || {{ cat {Q(m)}/tcpdump.log >&2; exit 1; }}\n'
+                    self.script(h, script)
+                elif action == 'stop':
+                    script = f'''set -euo pipefail
+    export LC_ALL=C S_TIME_FORMAT=ISO TZ=UTC
+    M={Q(m)}
+    mkdir -p "$M"
+    for f in "$M"/*.pid; do
+      [ -f "$f" ] || continue
+      sudo kill -INT "$(cat "$f")" 2>/dev/null || true
+      # timeout が子を回収してファイルを閉じるまで待つ。
+      for i in $(seq 600); do sudo kill -0 "$(cat "$f")" 2>/dev/null || break; sleep 0.1; done
+      if sudo kill -0 "$(cat "$f")" 2>/dev/null; then echo "計測を停止できません: $f" >&2; exit 1; fi
+      rm -f "$f"
+    done
+    '''
+                    script += 'analysis() { local name=$1; shift; if ! "$@"; then echo "解析失敗: $name" >> "$M/analysis-warnings.txt"; fi; }\n'
+                    if dbhost:
+                        if self.get('ISU_DB_KIND') == 'mysql':
+                            script += self.db('SET GLOBAL slow_query_log=OFF') + '\n'
+                            script += f'{self.get("ISU_DB_CMD", "sudo")} cat {Q(self.get("ISU_SLOW_LOG"))} > "$M/slow.log"\n'
+                            script += 'analysis pt-query-digest pt-query-digest --limit 30 "$M/slow.log" > "$M/slow.txt" 2> "$M/slow-errors.txt"\n'
+                        elif self.get('ISU_DB_KIND') == 'postgresql':
+                            script += 'analysis pg_stat_statements bash -c ' + Q(self.db('SELECT query, calls, total_exec_time, rows FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 30')) + ' > "$M/pg-stat-statements.txt" 2> "$M/pg-errors.txt"\n'
+                    if nginx:
+                        groups = self.root / 'conf/alp-groups.txt'
+                        patterns = [l.strip() for l in groups.read_text().splitlines() if l.strip() and not l.lstrip().startswith('#')] if groups.exists() else []
+                        group_arg = ' -m ' + Q(','.join(patterns)) if patterns else ''
+                        script += f'sudo cp {Q(self.get("ISU_ACCESS_LOG"))} "$M/access.log"\nsudo chmod a+r "$M/access.log"\n'
+                        script += f'analysis alp sudo alp json --file "$M/access.log" --sort sum -r -o count,1xx,2xx,3xx,4xx,5xx,method,uri,min,avg,max,sum,p99{group_arg} > "$M/alp.txt" 2> "$M/alp-stderr.txt"\n'
+                        script += f'analysis alp-errors sudo alp json --file "$M/access.log" --sort count -r -o count,method,uri,4xx,5xx{group_arg} -f \'Status >= 400\' > "$M/alp-errors.txt" 2> "$M/alp-errors-stderr.txt"\n'
+                    if app:
+                        script += 'if [ -s "$M/perf.data" ]; then analysis perf sudo perf report -i "$M/perf.data" --stdio --no-children -g none --sort comm,dso,sym --percent-limit 0.3 > "$M/perf-all.txt" 2> "$M/perf-errors.txt"; awk \'!/swapper/ && !/^#/ && NF\' "$M/perf-all.txt" > "$M/perf.txt"; fi\n'
+                        for svc in self.get('ISU_SERVICES_' + h).split():
+                            script += f'sudo journalctl -u {Q(svc)} --since "@$(cat "$M/t_start")" --no-pager -o short-iso >> "$M/journal-raw.txt"\n'
+                    script += 'find "$M" -name \'capture.pcap*\' -type f -exec sudo chmod a+r {} +\n'
+                    script += 'COPYFILE_DISABLE=1 tar -C "$M" --exclude=perf.data --exclude="capture.pcap*" -czf - .\n'
+                    p = self.script(h, script, binary=True)
+                    dest = r / h; dest.mkdir(exist_ok=True)
+                    with tarfile.open(fileobj=io.BytesIO(p.stdout), mode='r:gz') as tar:
+                        tar.extractall(dest, filter='data')
+                    captures = self.ssh(h, f'find {Q(m)} -maxdepth 1 -type f -name \'capture.pcap*\' -exec basename {{}} \\;').stdout.splitlines()
+                    for name in captures:
+                        if re.fullmatch(r'capture\.pcap[0-9]*', name):
+                            self.scp(f'{h}:{m}/{name}', str(dest / name))
+                    if (dest / 'journal-raw.txt').exists():
+                        (dest / 'journal.txt').write_text('\n'.join(journal_counts((dest / 'journal-raw.txt').read_text(errors='replace'))) + '\n')
+                    if (dest / 'analysis-warnings.txt').exists():
+                        warn(h + ': ' + (dest / 'analysis-warnings.txt').read_text(errors='replace').strip())
+            except (RuntimeError, OSError, sp.SubprocessError, tarfile.TarError) as error:
+                if not best_effort:
+                    raise
+                warn(h + ': 計測停止・回収に失敗: ' + str(error))
+                with (r / 'measure-warnings.txt').open('a') as file:
+                    file.write(h + ': ' + str(error) + '\n')
         if action == 'stop':
             self.window(id)
             self.summarize(id)
@@ -432,10 +492,15 @@ done
     def window(self, id):
         r = self.results / id
         counts = collections.Counter()
+        offset = None
         for path in r.glob('*/access.log'):
             for line in path.read_text(errors='replace').splitlines():
                 try:
                     row = json.loads(line)
+                    if row.get('time'):
+                        parsed = dt.datetime.fromisoformat(row['time'])
+                        if parsed.tzinfo:
+                            offset = parsed.strftime('%z')
                     t = float(row['msec']) if row.get('msec') else epoch(row['time'])
                     counts[int(t)] += 1
                 except (ValueError, KeyError, TypeError):
@@ -447,7 +512,8 @@ done
         if active:
             meta.update(START=str(active[0]), END=str(active[-1]))
             for key, t in [('START', active[0]), ('END', active[-1])]:
-                meta[key + '_HMS'] = dt.datetime.fromtimestamp(t).strftime('%H:%M:%S')
+                meta['TZ_OFFSET'] = offset or '+0000'
+                meta[key + '_HMS'] = dt.datetime.fromtimestamp(t, timezone(meta['TZ_OFFSET'])).strftime('%H:%M:%S')
         else:
             warn('アクセスログから窓を算出できません。START/END は未記録です')
         write_meta(r / 'meta.env', meta)
@@ -456,19 +522,51 @@ done
         r = self.results / id; m = read_meta(r / 'meta.env')
         lines = [f'# Bench {id}', '', '| score | result | label | commit | window | note |', '|---|---|---|---|---|---|',
                  '| ' + ' | '.join(str(m.get(k, '?')).replace('|', '\\|').replace('\n', ' ') for k in ['SCORE', 'RESULT', 'LABEL', 'SHA']) + f' | {m.get("START_HMS", "?")}–{m.get("END_HMS", "?")} | ' + m.get('NOTE', '').replace('|', '\\|').replace('\n', ' ') + ' |']
+        def text(path):
+            return path.read_text(errors='replace') if path.exists() else ''
+        def section(title, content):
+            if content:
+                lines.extend(['', '## ' + title, '', '```', *content, '```'])
+        lines += ['', '## CPU（ベンチ中の平均 %）', '', '| host | us | sy | wa | idle | max run queue | samples |', '|---|---|---|---|---|---|---|']
         for h in self.hosts():
-            for name in ['alp.txt', 'slow.txt', 'pg-stat-statements.txt', 'vmstat.log', 'pidstat.log', 'perf.txt', 'journal.txt']:
-                p = r / h / name
-                if p.exists():
-                    lines += ['', f'## {h}/{name}', '', '```', *p.read_text(errors='replace').splitlines()[:40], '```']
+            host = r / h
+            offset = text(host / 'tz-offset').strip() or m.get('TZ_OFFSET', '')
+            cpu = cpu_table(text(host / 'vmstat.log'), m, offset)
+            if cpu:
+                lines.append('| ' + h + ' | ' + ' | '.join(f'{v:.0f}' for v in cpu) + ' |')
+        lines += ['', '## プロセス別 CPU（窓の中の平均 %CPU。100 = 1コア）']
+        for h in self.hosts():
+            host = r / h
+            offset = text(host / 'tz-offset').strip() or m.get('TZ_OFFSET', '')
+            section(h + '・上位8プロセス', [f'{name:24s} {value:6.1f}' for name, value in processes(text(host / 'pidstat.log'), m, offset)])
+            section(h + '・エンドポイント（alp・上位25）', text(host / 'alp.txt').splitlines()[:29])
+            section(h + '・4xx / 5xx', text(host / 'alp-errors.txt').splitlines()[:15])
+            section(h + '・スロークエリ（Profile）', profile(text(host / 'slow.txt')))
+            section(h + '・PostgreSQL 上位', text(host / 'pg-stat-statements.txt').splitlines())
+            section(h + '・perf 上位40', [line for line in text(host / 'perf.txt').splitlines() if 'swapper' not in line][:40])
+            if not (host / 'perf.txt').exists():
+                section(h + '・perf 計測の警告', text(host / 'perf.out').splitlines()[:15])
+            section(h + '・アプリログ（件数順）', text(host / 'journal.txt').splitlines()[:20])
+            section(h + '・解析の警告', text(host / 'analysis-warnings.txt').splitlines())
+        section('ベンチ出力（末尾）', text(r / 'bench.log').splitlines()[-15:])
+        section('計測停止・回収の警告', text(r / 'measure-warnings.txt').splitlines())
         bw = self.root / 'tools/bench-window/bench-window'
         logs = [f'{p.parent.name}={p}' for p in r.glob('*/access.log') if p.stat().st_size]
         if logs and bw.exists():
-            args = [str(bw), *logs, '--last', '30s']
+            args = [str(bw), *logs, '--last', self.get('ISU_WINDOW_LAST', '30s'), '--top', '15']
             if (self.root / 'conf/alp-groups.txt').exists():
                 args += ['--group', str(self.root / 'conf/alp-groups.txt')]
+            args += ['--tz', m.get('TZ_OFFSET', '+0000')]
             for cpu in r.glob('*/pidstat.log'):
-                args += ['--cpu', f'{cpu.parent.name}={cpu}']
+                offset = text(cpu.parent / 'tz-offset').strip() or m.get('TZ_OFFSET', '')
+                normalized = []
+                for line in text(cpu).splitlines():
+                    cells = line.split()
+                    stamp = sample_time(cells[:1], m, offset)
+                    normalized.append(str(int(stamp)) + ' ' + ' '.join(cells[1:]) if stamp is not None else line)
+                path = cpu.with_name('pidstat-epoch.log')
+                path.write_text('\n'.join(normalized) + '\n')
+                args += ['--cpu', f'{cpu.parent.name}={path}']
             p = sp.run(args, capture_output=True, text=True)
             if p.returncode:
                 warn('bench-window が失敗しました: ' + p.stderr)
@@ -476,6 +574,7 @@ done
                 lines += ['', p.stdout]
         if m.get('ABORT_REASON'):
             lines += ['', '中止: ' + m['ABORT_REASON']]
+        lines += ['', '## 生データ', '', *['- ' + p.relative_to(r).as_posix() for p in sorted(r.rglob('*')) if p.is_file() and p.name != 'SUMMARY.md']]
         (r / 'SUMMARY.md').write_text('\n'.join(lines) + '\n')
 
     def scoreboard(self):
@@ -487,7 +586,7 @@ done
             lines.append('| ' + ' | '.join(v.replace('|', '\\|').replace('\n', ' ') for v in vals) + ' |')
         (self.results / 'SCOREBOARD.md').write_text('\n'.join(lines) + '\n')
 
-    def current(self, id=None):
+    def current(self, id=None, require_lock=True):
         path = self.state / 'bench-current'
         if not path.exists():
             fail('実行中のベンチがありません')
@@ -497,7 +596,7 @@ done
         if data.get('root') != str(self.root):
             fail('開始した checkout と一致しません')
         self.token = data['token']
-        if not self.held():
+        if require_lock and not self.held():
             fail('ベンチのロックが失われています')
         return data
 
@@ -575,27 +674,55 @@ done
             if not c['measure']:
                 fail('--no-measure のベンチはポータルで確認してください')
             self.measure('wait', c['id']); return
-        c = self.current(a.id); id = c['id']; r = self.results / id
+        c = self.current(a.id, require_lock=a.action != 'abort'); id = c['id']; r = self.results / id
         if a.action == 'finish' and (a.score is None or not a.result):
             fail('finish には --score と --pass/--fail が必要です')
         if a.action == 'abort' and not a.reason:
             fail('abort には --reason が必要です')
-        if a.portal_file:
-            shutil.copyfile(a.portal_file, r / 'portal.txt')
-        if c['measure']:
-            self.measure('stop', id)
         m = read_meta(r / 'meta.env')
         if a.action == 'abort':
             m.update(STATE='aborted', RESULT='fail', ABORT_REASON=a.reason)
         else:
-            m.update(STATE='finished', SCORE=str(a.score), RESULT=a.result, JOB=a.job or '')
+            m.update(STATE='collecting', SCORE=str(a.score), RESULT=a.result, JOB=a.job or m.get('JOB', ''))
+        write_meta(r / 'meta.env', m)
+        self.scoreboard()
+        if a.portal_file:
+            shutil.copyfile(a.portal_file, r / 'portal.txt')
+        if c['measure']:
+            self.measure('stop', id, best_effort=a.action == 'abort')
+        m = read_meta(r / 'meta.env')
+        if a.action == 'finish':
+            m['STATE'] = 'finished'
         write_meta(r / 'meta.env', m)
         self.summarize(id); self.scoreboard()
-        self.release(); (self.state / 'bench-current').unlink()
+        if a.action == 'abort':
+            try:
+                if self.held():
+                    self.release()
+                else:
+                    warn('ロックは失われています。他の処理のロックは解放しません')
+            except (RuntimeError, OSError, sp.SubprocessError) as error:
+                warn('ロックを確認できません: ' + str(error))
+        else:
+            self.release()
+        (self.state / 'bench-current').unlink()
         self.commit('bench ' + id, ['results/' + id, 'results/SCOREBOARD.md'])
         print(r / 'SUMMARY.md')
 
     def doctor(self, a):
+        if a.bootstrap:
+            required = ['ISU_HOSTS', 'ISU_PORTAL_URL', 'ISU_END_AT', 'ISU_FREEZE_AT', 'ISU_BOOT_USER', 'ISU_BOOT_KEY']
+            missing = [key for key in required if not self.get(key)]
+            missing += ['ISU_IP_' + h for h in self.get('ISU_HOSTS').split() if not self.get('ISU_IP_' + h)]
+            if missing:
+                fail('bootstrap: isu.env を埋めてください: ' + ', '.join(missing))
+            if not Path(self.get('ISU_BOOT_KEY')).is_file():
+                fail('起動用の鍵がありません: ISU_BOOT_KEY')
+            if epoch(self.get('ISU_FREEZE_AT')) >= epoch(self.get('ISU_END_AT')) - 60:
+                fail('凍結は終了の60秒前より早くしてください')
+            self.guard_time()
+            print('doctor bootstrap: OK（ssh はまだ使いません）')
+            return
         required = ['ISU_HOSTS', 'ISU_NGINX_HOST', 'ISU_APP_HOSTS', 'ISU_LOCK_HOST', 'ISU_TARGET_HOST',
                     'ISU_TARGET_SCHEME', 'ISU_TARGET_PORT', 'ISU_PORTAL_URL', 'ISU_END_AT', 'ISU_FREEZE_AT', 'ISU_DB_KIND', 'ISU_LANG']
         if self.get('ISU_LANG') != 'none':
@@ -653,8 +780,8 @@ done
         if not a.final:
             self.ssh(n, 'command -v alp')
         self.health()
-        logs = self.ssh(n, 'sudo nginx -T 2>&1').stdout
-        if re.search(r'access_log\s+off', logs):
+        logs = self.ssh(n, 'sudo cat /etc/nginx/conf.d/isu-log.conf').stdout
+        if re.search(r'^\s*access_log\s+off\s*;', logs, re.M):
             if a.final:
                 pass
             else:
@@ -693,6 +820,16 @@ done
         print(p.stdout, end='')
         return p.returncode
 
+    def close_mux(self, host):
+        self.guard_time()
+        sp.run(['ssh', '-F', str(self.config), '-O', 'exit', host], stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=self.connection_timeout())
+
+    def reboot_host(self, host):
+        try:
+            self.ssh(host, 'sudo systemctl reboot', check=False)
+        finally:
+            self.close_mux(host)
+
     def reboot(self, a):
         self.canonical(); own = self.acquire('reboot-test')
         try:
@@ -704,12 +841,12 @@ done
             services = {h: set(self.ssh(h, 'systemctl list-units --type=service --state=running --no-legend --plain').stdout.splitlines()) for h in hosts}
             if a.random:
                 for h in hosts:
-                    self.ssh(h, 'sudo systemctl reboot', check=False)
+                    self.reboot_host(h)
                     time.sleep(secrets.randbelow(15))
             else:
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=max(1, len(hosts))) as pool:
-                    list(pool.map(lambda h: self.ssh(h, 'sudo systemctl reboot', check=False), hosts))
+                    list(pool.map(lambda h: self.reboot_host(h), hosts))
             for h in hosts:
                 until = time.monotonic() + 300
                 while True:
@@ -718,6 +855,7 @@ done
                         break
                     if time.monotonic() >= until:
                         fail(h + ': 再起動後に復帰しません')
+                    self.close_mux(h)
                     time.sleep(5)
                 self.ssh(h, 'timeout 180 systemctl is-system-running --wait', check=False)
                 required = self.get('ISU_SERVICES_' + h).split()
@@ -839,7 +977,7 @@ printf '[mysqld]\nlong_query_time=0\nslow_query_log=0\nslow_query_log_file=%s\n'
         for p in paths:
             if not any(p == x.rstrip('/') or p.startswith(x.rstrip('/') + '/') for x in a.paths):
                 fail('宣言したパスの外です: ' + p)
-            if re.search(r'(^|/)(public|static|assets|dist|build)(/|$)|\.(?:css|js|png|jpe?g|svg|webp|gif|ico|woff2?)$', p):
+            if re.search(r'(^|/)(public|static|assets|dist|build)(/|$)|\.(?:css|js|png|jpe?g|svg|webp|gif|ico|woff2?)$', p) and not any(p == x.rstrip('/') or p.startswith(x.rstrip('/') + '/') for x in a.allow_static):
                 fail('静的ファイルの変更です: ' + p)
         # ブランチの内容を一時領域で調べる。checkout は変えない。
         import tempfile
@@ -877,13 +1015,14 @@ def parser(name):
     elif name == 'isu-lock':
         p.add_argument('action', choices=['status', 'acquire', 'release', 'force-release'], default='status', nargs='?'); p.add_argument('what', default='manual', nargs='?')
     elif name == 'isu-doctor':
-        p.add_argument('--final', action='store_true')
+        g = p.add_mutually_exclusive_group()
+        g.add_argument('--final', action='store_true'); g.add_argument('--bootstrap', action='store_true')
     elif name == 'isu-ssh':
         p.add_argument('--write', action='store_true'); p.add_argument('--during-hold', action='store_true'); p.add_argument('host'); p.add_argument('command', nargs=argparse.REMAINDER)
     elif name == 'isu-reboot-test':
         p.add_argument('--yes', action='store_true', required=True); p.add_argument('--random', action='store_true')
     elif name == 'isu-intake':
-        p.add_argument('branch'); p.add_argument('--paths', nargs='+', required=True)
+        p.add_argument('branch'); p.add_argument('--paths', nargs='+', required=True); p.add_argument('--allow-static', action='append', default=[])
     elif name == 'isu-backup':
         p.add_argument('label', nargs='?', default='initial')
     elif name == 'isu-export-seed':
@@ -897,6 +1036,9 @@ def parser(name):
 def main(name=None, argv=None):
     name = name or Path(sys.argv[0]).name
     if name == 'isu_runtime.py':
+        if sys.argv[1] == 'ssh-config':
+            Kit()
+            return 0
         if sys.argv[1] == 'setup-db':
             Kit().setup_db()
             return 0
@@ -953,7 +1095,7 @@ def main(name=None, argv=None):
                 k.canonical(); k.acquire(a.what); print('ISU_LOCK_TOKEN=' + k.token)
             elif a.action == 'release': k.release()
             else:
-                k.canonical(); k.ssh(k.get('ISU_LOCK_HOST'), 'rm -rf -- ' + Q(k.lockdir))
+                k.force_release()
         elif name == 'guard':
             if a.kind == 'time': k.guard_time()
             elif a.kind == 'canonical': k.canonical()

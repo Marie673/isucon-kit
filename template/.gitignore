@@ -18,3 +18,5 @@ __pycache__/
 
 ._*
 results/**/slow.log
+
+results/**/journal-raw.txt

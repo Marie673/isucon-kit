@@ -32,37 +32,8 @@ isu_services() { isu_var "ISU_SERVICES_$1"; }
 isu_hosts() { printf '%s\n' $ISU_HOSTS; }
 in_list() { local x="$1"; shift; for y in "$@"; do [ "$x" = "$y" ] && return 0; done; return 1; }
 
-# isu.env から ssh_config を生成（isu.env が新しければ作り直す）
-isu_gen_ssh_config() {
-  if [ -f "$ISU_SSH_CONFIG" ] && [ "$ISU_SSH_CONFIG" -nt "$ISU_ENV_FILE" ]; then return 0; fi
-  local h ip
-  {
-    echo "# generated from $ISU_ENV_FILE — 手で編集しない"
-    for h in $ISU_HOSTS; do
-      ip=$(isu_ip "$h")
-      [ -n "$ip" ] || continue
-      cat <<EOF
-Host $h
-  HostName $ip
-  User $ISU_SSH_USER
-  IdentityFile $ISU_SSH_KEY
-EOF
-    done
-    cat <<EOF
-Host *
-  IdentitiesOnly yes
-  StrictHostKeyChecking accept-new
-  UserKnownHostsFile $ISU_STATE/known_hosts
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-isu-%C
-  ControlPersist 60s
-  ServerAliveInterval 15
-  ConnectTimeout 10
-  LogLevel ERROR
-EOF
-  } > "$ISU_SSH_CONFIG"
-}
-isu_gen_ssh_config
+# ssh_config は Python の共通処理だけで生成する。
+uv run --no-project python "$ISU_ROOT/bin/isu_runtime.py" ssh-config
 
 isu_deadline() { uv run --no-project python "$ISU_ROOT/bin/isu_runtime.py" time-guard; }
 isu_ssh() { isu_deadline; local h="$1"; shift; [ -n "$(isu_ip "$h")" ] || die "$h の IP が isu.env にありません"; ssh -F "$ISU_SSH_CONFIG" "$h" "$@"; }

@@ -70,3 +70,15 @@ class CaptureTests(unittest.TestCase):
             with self.assertRaises(ValueError): list(cap.packets(p))
 
 if __name__=='__main__':unittest.main()
+
+class CaptureLimitTests(unittest.TestCase):
+    frame = CaptureTests.frame
+    write_pcap = CaptureTests.write_pcap
+    def test_size_limited_tail_keeps_first_complete_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'limited.pcap';out=Path(tmp)/'out.jsonl'
+            request=b'GET /first HTTP/1.1\r\nHost: app\r\n\r\n'
+            self.write_pcap(path,[(request,100,False),(b'x'*100,1000,False)],1)
+            path.write_bytes(path.read_bytes()[:-50])
+            cap.pcap(path,out)
+            self.assertEqual(json.loads(out.read_text())['uri'],'/first')

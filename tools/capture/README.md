@@ -25,3 +25,6 @@ TLS・HTTP/2・IP の断片化・IPv6 の拡張ヘッダー・pcapng は対象�
 
 テストは `uv run --no-project python -m unittest discover -s tools/capture/tests`。
 合成した pcap だけを使う。
+
+サイズ上限で止まった pcap の最後の不完全なパケットは、警告して除く。
+前の完全なパケットはそのまま復元する。

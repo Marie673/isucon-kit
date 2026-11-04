@@ -101,6 +101,37 @@ class BinTests(unittest.TestCase):
         self.assertNotIn('slow_query_log',self.commands())
         self.assertTrue(list((self.repo/'results').glob('*/SUMMARY.md')))
 
+    def test_disabled_nginx_and_db_are_not_started(self):
+        p=self.tool('deploy','--no-build',env={'FAKE_NGINX_INACTIVE':'1','FAKE_DB_DISABLED':'1'})
+        commands=[json.loads(line) for line in self.commands().splitlines()]
+        self.assertFalse(any(name=='systemctl' and args[:2] in [['reload','nginx'],['restart','mysql']] for name,args in commands))
+        self.assertTrue(any(name=='sudo' and args[:2]==['chown','root:root'] for name,args in commands))
+        self.config(ISU_DB_HOST='other')
+        before=len(self.commands())
+        self.tool('deploy','--no-build','--allow-dirty')
+        self.assertNotIn('"restart", "mysql"',self.commands()[before:])
+
+    def test_analysis_failure_still_collects_and_has_original_options(self):
+        id=self.start()
+        (self.home/'.isu-measure/perf.data').write_text('perf fixture')
+        p=self.tool('bench','finish',id,'--score','1','--pass',env={'FAKE_ANALYSIS_FAIL':'1'})
+        self.assertIn('解析失敗',p.stderr)
+        self.assertTrue((self.repo/'results'/id/'host/access.log').exists())
+        self.assertTrue((self.repo/'results'/id/'host/analysis-warnings.txt').exists())
+        calls=[json.loads(line) for line in self.commands().splitlines()]
+        alp=[args for name,args in calls if name=='alp' and '-o' in args]
+        self.assertIn('count,1xx,2xx,3xx,4xx,5xx,method,uri,min,avg,max,sum,p99',alp[0])
+        self.assertTrue(any('Status >= 400' in args for args in alp))
+        perf=[args for name,args in calls if name=='perf' and args[0]=='report'][0]
+        self.assertIn('--no-children',perf);self.assertIn('comm,dso,sym',perf)
+
+    def test_intake_explicit_backend_static_exception(self):
+        self.git('checkout','-qb','node')
+        app=self.repo/'webapp/node';app.mkdir(parents=True);(app/'index.js').write_text('console.log(1)')
+        self.git('add','webapp');self.git('commit','-qm','node');self.git('checkout','main')
+        self.tool('intake','node','--paths','webapp/node',code=1)
+        self.tool('intake','node','--paths','webapp/node','--allow-static','webapp/node/index.js')
+
     def test_token_prevents_same_owner_nested_deploy(self):
         token = self.tool('lock','acquire').stdout.strip().split('=',1)[1]
         self.tool('deploy','--no-build',code=1)
@@ -275,8 +306,11 @@ class BinTests(unittest.TestCase):
         self.assertTrue((result/'capture.pcap').exists())
         self.assertNotIn('capture.pcap',self.git('ls-files','results'))
         self.assertNotIn('access.log',self.git('ls-files','results'))
-        self.assertIn('16',self.commands())
-        self.assertIn('300',self.commands())
+        calls=[json.loads(line) for line in self.commands().splitlines()]
+        capture=[args for name,args in calls if name=='timeout' and any('tcpdump' in a for a in args)][0]
+        self.assertIn('1048576',capture)
+        self.assertIn('300',capture)
+        self.assertNotIn('-W',capture)
 
     def test_no_log_window_is_unrecorded(self):
         id=self.start()
@@ -313,6 +347,12 @@ class BinTests(unittest.TestCase):
         self.tool('doctor','--final',env={'FAKE_LOGS_OFF':'1'})
         (self.home/'.isu-deployed').write_text('wrong')
         self.tool('doctor','--final',code=1,env={'FAKE_LOGS_OFF':'1'})
+
+    def test_location_log_off_is_not_global_log_off(self):
+        self.tool('deploy','--no-build')
+        p=self.tool('doctor',env={'FAKE_LOCATION_OFF':'1'})
+        self.assertNotIn('アクセスログが off',p.stderr)
+        self.tool('doctor','--final',code=1,env={'FAKE_LOCATION_OFF':'1'})
 
     def test_missing_env_stops_doctor_and_logs_off_warns(self):
         p=self.tool('doctor',env={'FAKE_LOGS_OFF':'1'})

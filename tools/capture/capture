@@ -35,13 +35,15 @@ def packets(path):
             raise ValueError(f'未対応のリンク種別: {link}')
         while raw := f.read(16):
             if len(raw) < 16:
-                raise ValueError('pcap のレコードが短い')
+                print('警告: 末尾の不完全な pcap レコードを除きます', file=sys.stderr)
+                break
             sec, fraction, size, _ = struct.unpack(endian + 'IIII', raw)
             if size > MAX_STREAM:
                 raise ValueError('パケットが大きすぎる')
             frame = f.read(size)
             if len(frame) != size:
-                raise ValueError('pcap のパケットが短い')
+                print('警告: 末尾の不完全なパケットを除きます', file=sys.stderr)
+                break
             offset = {0: 4, 1: 14, 113: 16, 276: 20}[link]
             if link == 1 and len(frame) >= 18 and frame[12:14] in (b'\x81\x00', b'\x88\xa8'):
                 offset += 4

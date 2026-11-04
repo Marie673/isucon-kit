@@ -17,9 +17,11 @@ server = Path(os.environ['FAKE_SERVER'])
 with (server / 'commands.jsonl').open('a') as f:
     f.write(json.dumps([name, args]) + '\n')
 if name == 'ssh':
+    if '-O' in args:
+        sys.exit(0)
     while args and args[0].startswith('-'):
         flag = args.pop(0)
-        if flag in ['-F', '-o', '-O']:
+        if flag in ['-F', '-o', '-O', '-p']:
             args.pop(0)
     host = args.pop(0)
     command = ' '.join(args)
@@ -51,12 +53,18 @@ if name == 'ssh':
     if data is not None:
         data = localize(data)
     command = localize(command)
+    if os.environ.get('FAKE_SSH_FAIL_HOST') == host:
+        sys.exit(255)
     p = subprocess.run(['bash', '-c', command], input=data, text=True, env=env, cwd=home)
     sys.exit(p.returncode)
 if name == 'scp':
     src, dst = args[-2:]
-    host, dest = dst.split(':', 1)
-    shutil.copy2(src, dest)
+    if ':' in src:
+        _, src = src.split(':', 1)
+        shutil.copy2(src, dst)
+    else:
+        host, dest = dst.split(':', 1)
+        shutil.copy2(src, dest)
     sys.exit(0)
 if name == 'sudo':
     # テスト外の root 権限やプロセスへ触れない。
@@ -93,6 +101,10 @@ elif name == 'sed':
         target.unlink()
     target.write_text(text)
 elif name == 'systemctl':
+    if args[0] == 'is-active' and args[-1] == 'nginx' and os.environ.get('FAKE_NGINX_INACTIVE'):
+        sys.exit(3)
+    if args[0] == 'is-enabled' and args[-1] in ['mysql','postgresql'] and os.environ.get('FAKE_DB_DISABLED'):
+        sys.exit(1)
     if args[0] == 'restart' and os.environ.get('FAKE_RESTART_FAIL'):
         print('起動失敗', file=sys.stderr); sys.exit(1)
     if args[0] == 'show':
@@ -110,7 +122,9 @@ elif name == 'curl':
     if os.environ.get('FAKE_CURL_FAIL'):
         sys.exit(7)
 elif name == 'nginx':
-    if '-T' in args:
+    if '-T' in args and os.environ.get('FAKE_LOCATION_OFF'):
+        print('location /health { access_log off; }')
+    elif '-T' in args:
         print('access_log off;' if os.environ.get('FAKE_LOGS_OFF') else 'access_log /var/log/nginx/access.log isu_json;')
 elif name == 'mysql':
     sql = ' '.join(args)
@@ -135,7 +149,13 @@ elif name in ['mysqldump', 'pg_dump']:
     if not os.environ.get('FAKE_DUMP_EMPTY'):
         print('CREATE TABLE items(id int);')
 elif name == 'alp':
+    if os.environ.get('FAKE_ANALYSIS_FAIL'):
+        sys.exit(1)
     print('alp v1.0.22' if '--version' in args else 'alp table')
+elif name in ['perf', 'pt-query-digest']:
+    if os.environ.get('FAKE_ANALYSIS_FAIL'):
+        sys.exit(1)
+    print('fake profile')
 elif name == 'journalctl':
     print('journal: 起動に失敗しました')
 elif name == 'codex':
@@ -146,11 +166,13 @@ elif name == 'codex':
 elif name == 'cat':
     if args == ['/proc/sys/kernel/random/boot_id']:
         print((server / 'boot').read_text() if (server / 'boot').exists() else 'initial')
+    elif args and args[0].endswith('/etc/nginx/conf.d/isu-log.conf'):
+        print('access_log off;' if os.environ.get('FAKE_LOGS_OFF') else 'access_log /var/log/nginx/access.log isu_json;')
     else:
         sys.exit(subprocess.run(['/bin/cat', *args]).returncode)
 elif name == 'timeout':
-    if 'tcpdump' in args:
-        target=Path(args[args.index('-w')+1]+'0')
+    if any('tcpdump' in x for x in args):
+        target=Path(args[-2])
         target.write_bytes(b'pcap header')
     # 計測の子プロセスを作らない。
     sys.exit(0)

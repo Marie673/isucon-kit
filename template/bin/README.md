@@ -31,4 +31,19 @@ sqlite は DB ファイルを ISU_DB_PATH に置く。
 
 生の access.log・http.jsonl・pcap はコミットしない。
 capture はアプリの平文ポートだけで使う。
-時間は300秒、サイズは16MBを2ファイルまでとする。
+時間は ISU_CAPTURE_SECS（既定300秒）、サイズは ISU_CAPTURE_MB（既定1024MiB）までにする。
+上限で停止し、先頭を上書きしない。pcap は scp で別に回収する。
+サイズ上限の末尾の不完全なパケットは解析で除く。
+
+初回は `isu-doctor --bootstrap` で IP・時刻・ポータル・起動用の鍵だけを検査する。
+鍵配布・導入・inventory・設定・import の後で通常の doctor を使う。
+`isu-ssh` はコマンドを省略できない。例は `bin/isu-ssh isu1 uptime`。
+`isu-intake --allow-static <パス>` は、Node の実装などを明示して検査を通すために使う。
+宣言したパスと永続化の検査は省略しない。
+ロック消失時も `isu-bench abort` はホストごとに停止を試す。
+停止できないホストは記録し、他の処理のロックを解放しない。
+force-release の後は、表示された `isu-measure stop <id>` で残った計測を片付ける。
+
+vmstat と pidstat は UTC で採り、pidstat は epoch 秒も使う。
+過去のログはホストごとの tz-offset で変換する。
+アクセスログの offset を使う表示と、CPU の秒を取り違えない。

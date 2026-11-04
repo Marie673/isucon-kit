@@ -15,7 +15,8 @@ for h in $ISU_HOSTS; do
   # まず isucon で入れるなら何もしない
   if isu_ssh "$h" -o BatchMode=yes true 2>/dev/null; then ok "$h: isucon で接続済み"; continue; fi
   log "$h: $ISU_BOOT_USER@$ip で鍵を配布"
-  printf '%s\n' "$keys" | ssh -i "$ISU_BOOT_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+  port=$(isu_var "ISU_SSH_PORT_$h"); port=${port:-22}
+  printf '%s\n' "$keys" | ssh -p "$port" -i "$ISU_BOOT_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
     -o UserKnownHostsFile="$ISU_STATE/known_hosts" "$ISU_BOOT_USER@$ip" \
     'sudo install -d -m 700 -o isucon -g isucon /home/isucon/.ssh &&
      sudo touch /home/isucon/.ssh/authorized_keys &&
