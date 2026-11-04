@@ -78,7 +78,6 @@ def main():
             obsolete = previous - expected
             # 管理一覧を持たない旧版の廃止した道具も更新する。
             obsolete.add('bin/isu-task')
-            obsolete.update(str(p.relative_to(dst)) for p in (dst / '.agents/skills/isu-playbook/references').glob('*.md'))
             for rel in obsolete:
                 out = dst / rel
                 if out.is_file() and not out.is_symlink() and '..' not in Path(rel).parts and not Path(rel).is_absolute():

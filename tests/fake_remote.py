@@ -25,6 +25,11 @@ if name == 'ssh':
             args.pop(0)
     host = args.pop(0)
     command = ' '.join(args)
+    missing=[x for x in os.environ.get('FAKE_NO_TOOLS','').split(',') if x]
+    if os.environ.get('FAKE_NO_NGINX'):
+        missing.append('nginx')
+    if any(command == 'command -v '+x for x in missing):
+        sys.exit(1)
     home = server / host / 'home'
     home.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, 'HOME': str(home), 'FAKE_HOST': host}

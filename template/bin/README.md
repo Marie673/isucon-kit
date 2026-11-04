@@ -38,6 +38,7 @@ capture はアプリの平文ポートだけで使う。
 初回は `isu-doctor --bootstrap` で IP・時刻・ポータル・起動用の鍵だけを検査する。
 鍵配布・導入・inventory・設定・import の後で通常の doctor を使う。
 `isu-ssh` はコマンドを省略できない。例は `bin/isu-ssh isu1 uptime`。
+リダイレクトや合成では拒否しない。変更系の語は worktree からは拒否し、main の checkout からは警告して通す。
 `isu-intake --allow-static <パス>` は、Node の実装などを明示して検査を通すために使う。
 宣言したパスと永続化の検査は省略しない。
 ロック消失時も `isu-bench abort` はホストごとに停止を試す。

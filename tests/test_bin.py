@@ -185,9 +185,41 @@ class BinTests(unittest.TestCase):
         self.tool('ssh','host','uptime',code=1)
         self.tool('ssh','--during-hold','host','echo ok')
         self.tool('lock','release',env={'ISU_LOCK_TOKEN':token})
-        for command in ['systemctl restart app','rm file','sed -i s/a/b/ file','mysql -e "UPDATE t SET x=1"','echo x > file','sh -c true']:
-            self.tool('ssh','host',command,code=1)
-        self.tool('ssh','--write','host','systemctl restart app')
+        # 読み取りはリダイレクトや合成でも止めない。
+        for command in ['echo x 2>/dev/null','uptime; true','echo $(date)','sh -c true','mysql -e "SELECT updated_at FROM t"']:
+            self.tool('ssh','host',command)
+        # 変更系は main から警告して通し、worktree からは拒否する。
+        other=self.base/'read-only'
+        self.git('worktree','add','-b','reader',str(other))
+        for command in ['systemctl restart app','rm file','sed -i s/a/b/ file','mysql -e "UPDATE t SET x=1"']:
+            p=self.tool('ssh','host',command,code=None)
+            self.assertIn('変更系',p.stderr)
+            p=self.command([other/'bin/isu-ssh','host',command],cwd=other,code=1)
+            self.assertIn('worktree',p.stderr)
+        self.command([other/'bin/isu-ssh','host','uptime'],cwd=other)
+
+    def test_doctor_warns_and_bench_runs_without_nginx(self):
+        p=self.tool('doctor',env={'FAKE_NO_NGINX':'1'})
+        self.assertIn('nginx ではありません',p.stderr)
+        self.config(ISU_NGINX_HOST='',ISU_ACCESS_LOG='/nonexistent/access.log')
+        p=self.tool('doctor')
+        self.assertIn('nginx ではありません',p.stderr)
+        id=self.start()
+        self.tool('bench','finish',id,'--score','10','--pass')
+        self.assertIn('## CPU',(self.repo/'results'/id/'SUMMARY.md').read_text())
+
+    def test_missing_measure_tool_only_warns(self):
+        p=self.tool('doctor',env={'FAKE_NO_TOOLS':'vmstat,alp'})
+        self.assertIn('vmstat がありません',p.stderr)
+        self.assertIn('alp がありません',p.stderr)
+
+    def test_untracked_files_are_not_dirty_but_are_named(self):
+        self.git('add','-A');self.git('commit','-qm','clean','--allow-empty')
+        (self.repo/'memo.txt').write_text('scratch')
+        extra=self.repo/'hosts/common/etc/nginx/extra.conf';extra.parent.mkdir(parents=True,exist_ok=True);extra.write_text('#')
+        p=self.tool('deploy','--no-build')
+        self.assertIn('hosts/common/etc/nginx/extra.conf',p.stderr)
+        self.assertNotIn('dirty',(self.home/'.isu-deployed').read_text())
 
     def test_deadline_and_freeze(self):
         self.config(ISU_END_AT='2000-01-01T18:00:00+09:00')

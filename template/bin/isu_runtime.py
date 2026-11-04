@@ -180,7 +180,7 @@ class Kit:
         sha = output(['git', 'log', '-1', '--format=%h', '--', '.', ':!results', ':!docs'])
         if not sha:
             sha = output(['git', 'rev-parse', '--short', 'HEAD'])
-        dirty = output(['git', 'status', '--porcelain', '--', '.', ':!results', ':!docs'])
+        dirty = output(['git', 'status', '--porcelain', '--untracked-files=no', '--', '.', ':!results', ':!docs'])
         return sha + ('-dirty' if dirty else '')
 
     def commit(self, msg, paths):
@@ -211,6 +211,9 @@ class Kit:
                            '--resolve', f'{host}:{port}:127.0.0.1', f'{scheme}://{host}:{port}{path or self.get("ISU_HEALTH_PATH", "/")}'])
 
     def health(self):
+        if not self.get('ISU_NGINX_HOST'):
+            warn('ISU_NGINX_HOST が空です。ヘルスチェックを飛ばします')
+            return
         for attempt in range(3):
             p = self.ssh(self.get('ISU_NGINX_HOST'), self.health_command(), check=False)
             code = p.stdout.strip()
@@ -267,6 +270,9 @@ class Kit:
         if sha.endswith('-dirty') and not a.allow_dirty:
             fail('未コミットの変更があります（--allow-dirty）')
         self.durability()
+        untracked = output(['git', 'ls-files', '--others', '--exclude-standard', '--', 'hosts', *self.get('ISU_DEPLOY_PATHS').split()])
+        if untracked:
+            warn('追跡していないファイルも反映します: ' + ' '.join(untracked.splitlines()))
         own = self.acquire('deploy ' + sha)
         try:
             if not a.no_build:
@@ -378,6 +384,8 @@ rm -rf -- "$stage"
     def measure(self, action, id, capture=False, best_effort=False):
         r = self.results / id
         r.mkdir(parents=True, exist_ok=True)
+        if action == 'wait' and not self.get('ISU_NGINX_HOST'):
+            print('流量を見られません。ポータルで job を確認してください。'); return
         if action == 'wait':
             prev = None; started = False; quiet = 0
             until = time.monotonic() + 1800
@@ -405,7 +413,7 @@ rm -rf -- "$stage"
                 if action == 'start':
                     script = f'set -euo pipefail\nexport LC_ALL=C S_TIME_FORMAT=ISO TZ=UTC\nrm -rf -- {Q(m)}\nmkdir -p {Q(m)}\ndate +%s > {Q(m)}/t_start\ndate +%z > {Q(m)}/tz-offset\n'
                     if nginx:
-                        script += f'sudo truncate -s0 {Q(self.get("ISU_ACCESS_LOG"))}\n'
+                        script += f'if sudo test -e {Q(self.get("ISU_ACCESS_LOG"))}; then sudo truncate -s0 {Q(self.get("ISU_ACCESS_LOG"))}; fi\n'
                     if dbhost:
                         if self.get('ISU_DB_KIND') == 'mysql':
                             script += f'{self.get("ISU_DB_CMD", "sudo")} truncate -s0 {Q(self.get("ISU_SLOW_LOG"))}\n' + self.db('SET GLOBAL slow_query_log=ON') + '\n'
@@ -458,9 +466,10 @@ rm -rf -- "$stage"
                         groups = self.root / 'conf/alp-groups.txt'
                         patterns = [l.strip() for l in groups.read_text().splitlines() if l.strip() and not l.lstrip().startswith('#')] if groups.exists() else []
                         group_arg = ' -m ' + Q(','.join(patterns)) if patterns else ''
-                        script += f'sudo cp {Q(self.get("ISU_ACCESS_LOG"))} "$M/access.log"\nsudo chmod a+r "$M/access.log"\n'
+                        script += f'if sudo test -e {Q(self.get("ISU_ACCESS_LOG"))}; then\nsudo cp {Q(self.get("ISU_ACCESS_LOG"))} "$M/access.log"\nsudo chmod a+r "$M/access.log"\n'
                         script += f'analysis alp sudo alp json --file "$M/access.log" --sort sum -r -o count,1xx,2xx,3xx,4xx,5xx,method,uri,min,avg,max,sum,p99{group_arg} > "$M/alp.txt" 2> "$M/alp-stderr.txt"\n'
                         script += f'analysis alp-errors sudo alp json --file "$M/access.log" --sort count -r -o count,method,uri,4xx,5xx{group_arg} -f \'Status >= 400\' > "$M/alp-errors.txt" 2> "$M/alp-errors-stderr.txt"\n'
+                        script += 'fi\n'
                     if app:
                         script += 'if [ -s "$M/perf.data" ]; then analysis perf sudo perf report -i "$M/perf.data" --stdio --no-children -g none --sort comm,dso,sym --percent-limit 0.3 > "$M/perf-all.txt" 2> "$M/perf-errors.txt"; awk \'!/swapper/ && !/^#/ && NF\' "$M/perf-all.txt" > "$M/perf.txt"; fi\n'
                         for svc in self.get('ISU_SERVICES_' + h).split():
@@ -723,7 +732,7 @@ rm -rf -- "$stage"
             self.guard_time()
             print('doctor bootstrap: OK（ssh はまだ使いません）')
             return
-        required = ['ISU_HOSTS', 'ISU_NGINX_HOST', 'ISU_APP_HOSTS', 'ISU_LOCK_HOST', 'ISU_TARGET_HOST',
+        required = ['ISU_HOSTS', 'ISU_APP_HOSTS', 'ISU_LOCK_HOST', 'ISU_TARGET_HOST',
                     'ISU_TARGET_SCHEME', 'ISU_TARGET_PORT', 'ISU_PORTAL_URL', 'ISU_END_AT', 'ISU_FREEZE_AT', 'ISU_DB_KIND', 'ISU_LANG']
         if self.get('ISU_LANG') != 'none':
             required += ['ISU_SRC_DIR', 'ISU_BIN_NAME', 'ISU_REMOTE_BIN']
@@ -761,9 +770,9 @@ rm -rf -- "$stage"
                     self.ssh(h, 'systemctl is-enabled ' + Q(svc))
                     self.ssh(h, 'systemctl is-active ' + Q(svc))
             if not a.final:
-                self.ssh(h, 'command -v vmstat && command -v pidstat')
+                self.want(h, 'vmstat', 'pidstat')
                 if h in self.get('ISU_APP_HOSTS').split():
-                    self.ssh(h, 'command -v perf && command -v tcpdump')
+                    self.want(h, 'perf', 'tcpdump')
             if a.final:
                 deployed = self.ssh(h, f'cat {Q(self.home)}/.isu-deployed').stdout.strip()
                 if deployed != self.code_sha() or deployed.endswith('-dirty'):
@@ -773,21 +782,21 @@ rm -rf -- "$stage"
                 if not free.isdigit() or int(free) < 102400:
                     fail(h + ': ディスクの空きが100MiB未満、または読めません')
         n = self.get('ISU_NGINX_HOST')
-        p = self.ssh(n, 'command -v nginx', check=False)
-        if p.returncode:
-            fail('nginx 以外の入口は未対応です。JSON ログを用意し、手動で計測して --no-measure を使ってください')
-        self.ssh(n, 'sudo nginx -t')
-        if not a.final:
-            self.ssh(n, 'command -v alp')
+        if n and self.ssh(n, 'command -v nginx', check=False).returncode == 0:
+            self.ssh(n, 'sudo nginx -t')
+            if not a.final:
+                self.want(n, 'alp')
+            logs = self.ssh(n, 'sudo cat /etc/nginx/conf.d/isu-log.conf 2>/dev/null || true').stdout
+            if re.search(r'^\s*access_log\s+off\s*;', logs, re.M):
+                if not a.final:
+                    warn('アクセスログが off です。計測つきベンチの前に isu-logs on、最終ベンチは --no-measure を使ってください')
+            elif a.final:
+                fail('最終検査: isu-logs off でログを止めてください')
+        else:
+            warn('入口が nginx ではありません。先へ進みます。CPU・プロセス・perf・DB の計測はそのまま動きます。'
+                 '入口のログを JSON で ISU_ACCESS_LOG に出せば、窓と capture flows も使えます。'
+                 'ログが無ければ tcpdump の --capture で読むか、ISU_NGINX_HOST を空にします')
         self.health()
-        logs = self.ssh(n, 'sudo cat /etc/nginx/conf.d/isu-log.conf').stdout
-        if re.search(r'^\s*access_log\s+off\s*;', logs, re.M):
-            if a.final:
-                pass
-            else:
-                warn('アクセスログが off です。計測つきベンチの前に isu-logs on、最終ベンチは --no-measure を使ってください')
-        elif a.final:
-            fail('最終検査: isu-logs off でログを止めてください')
         if self.get('ISU_DB_KIND') != 'none':
             h = self.get('ISU_DB_HOST')
             self.ssh(h, self.db('SELECT 1'))
@@ -795,7 +804,7 @@ rm -rf -- "$stage"
                 self.ssh(h, self.db('SELECT count(*) FROM pg_stat_statements'))
             if self.get('ISU_DB_KIND') == 'mysql':
                 if not a.final:
-                    self.ssh(h, 'command -v pt-query-digest')
+                    self.want(h, 'pt-query-digest')
                 elif self.ssh(h, self.db('SELECT @@global.slow_query_log')).stdout.strip() != '0':
                     fail('slow_query_log を止めてください')
         if a.final:
@@ -804,18 +813,26 @@ rm -rf -- "$stage"
             self.durability(final=True)
         print('doctor: OK')
 
+    def want(self, host, *tools):
+        # 足りない計測の道具で止めない。無いまま進める道を伝える。
+        for tool in tools:
+            if self.ssh(host, 'command -v ' + Q(tool), check=False).returncode:
+                warn(f'{host}: {tool} がありません。bin/isu-setup で入れられます。無ければその計測なしで進みます')
+
     def ssh_cli(self, a):
         if self.owner() and not a.during_hold:
             fail('HOLD 中の接続を拒否します（--during-hold）')
         command = shlex.join(a.command) if len(a.command) > 1 else ' '.join(a.command)
         if not command:
             fail('コマンドを明示してください')
-        # shell の合成・置換も書き込みと同じ扱いにする。
-        risky = r'(?:\b(?:rm|mv|tee|apt|apt-get|kill|reboot|shutdown)\b|\bsed\b.*\s-i|\bsystemctl\b[^|&\n]*\b(?:restart|stop|start|enable|disable|reload)\b|[<>;`]|\$\(|\b(?:insert|update|delete|drop|alter|truncate|create|replace|grant|revoke|set|load|call)\b|\b(?:bash|sh|python\w*|perl|ruby|env|xargs|find|chmod|chown|touch|cp|install)\b)'
-        if re.search(risky, command, re.I) and not a.write:
-            fail('変更系に見えるコマンドです。main で --write を付けてください')
-        if a.write:
-            self.canonical()
+        # 読み取りを止めない。リダイレクトや合成だけでは拒否しない。
+        risky = (r'\b(?:rm|mv|tee|apt|apt-get|kill|pkill|reboot|shutdown|chmod|chown|truncate)\b|\bsed\b.*\s-i'
+                 r'|\bsystemctl\b[^|&\n]*\b(?:restart|stop|start|enable|disable|reload)\b'
+                 r'|\b(?:mysql|psql|sqlite3)\b.*\b(?:insert|update|delete|drop|alter|truncate|create|replace|grant|revoke|load)\b')
+        if re.search(risky, command, re.I):
+            if self.root != self.main or self.branch != 'main':
+                fail('変更系に見えるコマンドです。worktree からは変更しません。メインエージェントに返してください')
+            warn('変更系に見えるコマンドを通します。残す変更は hosts/ と bin/isu-deploy に入れてください')
         p = self.ssh(a.host, command, check=False)
         print(p.stdout, end='')
         return p.returncode

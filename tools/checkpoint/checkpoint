@@ -15,12 +15,14 @@ import time
 
 
 def schedule(start, end=None):
-    due = [(start + 1800, 'design', '制約と最初の計測から docs/design.md の骨格を書く。'),
-           (start + 3600, 'audit', '見たもの → 考え → 決めたことを根拠と突き合わせる。')]
+    due = [(start + 1800, 'design', '0 ベースの設計の骨格はあるか。制約と最初のベンチの数字から、`docs/design.md` の D6 に「制約に最も合う形」を書いたか。継ぎ足しを選ぶなら、継ぎ足しのままボトルネックを取り除ける計算を DECISIONS.md に書いたか。却下の理由は回避の形を挙げて突き合わせたか。まだなら今やる。'),
+           (start + 2700, 'cpu3', 'プロファイルからサーバーごとの CPU の上位の処理を出し、それぞれに (1) 前もって計算できるか (2) 同じ入力の結果を覚えられるか (3) CPU の機能の合うサーバーに移せるか、を当ててボトルネック表に載せる。'),
+           (start + 3600, 'audit1', '監査: subagent を 1 本出し、skill audit の項目を、DECISIONS.md・ボトルネック表・experiments.md・results/ と突き合わせさせる（読み取りだけ、20 分以内、結論と出典だけを返させる）。返ってきた指摘で、判断を崩す情報があれば判断を出し直す。待たずに今の仕事を続ける。'),
+           (start + 10800, 'audit2', '監査: skill audit で 2 回目の監査の subagent を出す（読み取りだけ）。スコアが 30 分以上更新されていなければ、スコアの帳簿とスコアの式の項を数え直してから次の手を選ぶ。')]
     if end is not None:
-        due += [(end - 7200, 'review', '前提を見直し、試験中のフラグを片付ける。'),
-                (end - 3600, 'reboot', '再起動試験と直後のベンチを確認する。'),
-                (end - 1800, 'final', 'docs/RULES.md の時刻表で凍結を確認する。最終ベンチは tools/stop-rule/stop-rule で決める。')]
+        due += [(end - 10800, 'review', '前提の見直し: 作戦ボードを直し、design.md の D の却下した案の前提が今も成り立つかを数字で確かめる。skill audit で 3 回目の監査の subagent も出す。試験中のフラグを片付ける。'),
+                (end - 7200, 'reboot', '再起動試験: 全サーバーを同時に再起動し、手作業なしで上がること・書いたデータが残ること・直後のベンチが pass することを確かめる（版が固まっていれば前倒し済みでよい）。'),
+                (end - 3600, 'final', '終盤: 作戦ボードを直す。凍結は docs/RULES.md の時刻表の時刻に行い、前倒ししない。凍結の後は待機せず、ブランチで差を詰める。最終ベンチは tools/stop-rule/stop-rule で止める（同じ版のスコアの一覧と、締め切りまでに流せる本数から閾値を出す）。')]
     return sorted(due)
 
 
@@ -63,7 +65,7 @@ def main():
         key = 'stale-' + str(since)
         if n >= 3 and key not in data['fired']:
             data['fired'].append(key)
-            messages.append('作戦ボードの判断の数字を直す。効く項・取りこぼし・今のボトルネック・撤回の条件を確かめる。')
+            messages.append('[checkpoint stale] 作戦ボードの判断の数字を最後に直してから、ベンチが ' + str(n) + ' 本流れた。表（点・点の式の項・取りこぼし・今のボトルネック・撤回の条件）を直してから次の手を選ぶ。撤回の条件を満たしていたら判断を出し直す。効く項を止めているものをボトルネックに選ぶ（skill audit の 3・7c）。')
         state.write_text(json.dumps(data))
         if messages:
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse', 'additionalContext': '\n'.join(messages)}}, ensure_ascii=False))
