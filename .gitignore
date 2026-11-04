@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# テストの fixtures。利用者のグローバルな *.log の除外に左右されないようにする
+!tools/bench-window/tests/fixtures/*.log

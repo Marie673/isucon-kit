@@ -1,0 +1,5 @@
+{"commit": "a1b2c3d", "score": 10120, "pass": true, "label": "baseline"}
+{"commit": "a1b2c3d", "score": 9340, "pass": true, "label": "baseline"}
+{"commit": "a1b2c3d", "score": 10480, "pass": true, "label": "baseline"}
+{"commit": "9c8d7e6", "score": 13020, "pass": true, "label": "tune-b"}
+{"commit": "9c8d7e6", "score": 12480, "pass": false, "label": "tune-b"}

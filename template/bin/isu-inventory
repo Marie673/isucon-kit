@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# isu-inventory — 全ホストの状態をテキストに落とす -> docs/inventory/
+#   <host>.md       : OS / CPU / メモリ / ディスク / 稼働サービス / LISTEN ポート / cron / env.sh
+#   <host>-nginx.txt: nginx -T
+#   <host>.cpuinfo / cpu-features.md: CPU の機能（tools/cpu-features があれば表にする）
+#   db.md           : MySQL の主要変数・テーブルごとの行数とサイズ
+#   schema.sql      : SHOW CREATE TABLE 全部（インデックス設計の材料）
+. "$(dirname "$0")/lib.sh"
+out="$ISU_ROOT/docs/inventory"; mkdir -p "$out"
+
+for h in $ISU_HOSTS; do
+  [ -n "$(isu_ip "$h")" ] || continue
+  log "$h"
+  isu_sh "$h" > "$out/$h.md" <<'EOS'
+sec() { printf '\n## %s\n\n```\n' "$1"; shift; "$@" 2>&1; printf '```\n'; }
+echo "# $(hostname)"
+sec "OS / kernel" sh -c 'grep PRETTY_NAME /etc/os-release; uname -srm'
+sec "CPU / メモリ / ディスク" sh -c 'nproc; lscpu | grep -E "Model name|Thread|Core|Socket"; free -h; df -h / /home 2>/dev/null | uniq'
+sec "稼働中のサービス" systemctl list-units --type=service --state=running --no-pager --no-legend
+sec "LISTEN ポート" sudo ss -lntpH
+sec "cron" sh -c 'crontab -l 2>/dev/null; ls /etc/cron.d 2>/dev/null'
+sec "/home/isucon" ls -la /home/isucon
+[ -f /home/isucon/env.sh ] && sec "env.sh" cat /home/isucon/env.sh
+sec "メモリ上位プロセス" sh -c 'ps aux --sort=-rss | head -12'
+command -v nginx >/dev/null && sudo nginx -T > /tmp/isu-nginx-T.txt 2>&1
+true
+EOS
+  isu_ssh "$h" 'cat /tmp/isu-nginx-T.txt 2>/dev/null' > "$out/$h-nginx.txt" || true
+  isu_ssh "$h" 'cat /proc/cpuinfo' > "$out/$h.cpuinfo" 2>/dev/null || rm -f "$out/$h.cpuinfo"
+  [ -s "$out/$h-nginx.txt" ] || rm -f "$out/$h-nginx.txt"
+done
+
+if [ -n "$ISU_DB_HOST" ]; then
+  log "$ISU_DB_HOST: MySQL"
+  isu_sh "$ISU_DB_HOST" "$ISU_DB_NAME" > "$out/db.md" <<'EOS'
+DB=$1
+q() { sudo mysql -t -e "$1" "$DB" 2>&1; }
+echo "# MySQL ($DB)"; echo; echo '```'
+q "select version()"
+q "show global variables where Variable_name in ('innodb_buffer_pool_size','innodb_flush_log_at_trx_commit','innodb_log_file_size','max_connections','log_bin','sync_binlog','innodb_doublewrite','disable_log_bin','skip_name_resolve','transaction_isolation')"
+echo '```'; echo; echo "## テーブル（行数は概算）"; echo; echo '```'
+q "select table_name, table_rows, round(data_length/1024/1024,1) data_mb, round(index_length/1024/1024,1) index_mb, engine from information_schema.tables where table_schema='$DB' order by data_length desc"
+echo '```'
+EOS
+  isu_sh "$ISU_DB_HOST" "$ISU_DB_NAME" > "$out/schema.sql" <<'EOS'
+DB=$1
+for t in $(sudo mysql -NBe 'show tables' "$DB"); do
+  sudo mysql -NBe "show create table \`$t\`" "$DB" | cut -f2- | sed 's/\\n/\n/g'; echo ';'; echo
+done
+EOS
+fi
+# 台ごとの CPU の機能（isucon-kit の tools/cpu-features があるとき）。台によって速さが変わる処理（SHA・AES・SIMD）を先頭に出す
+cf="$ISU_ROOT/tools/cpu-features/cpu-features"
+if [ -x "$cf" ]; then
+  args=(); for h in $ISU_HOSTS; do [ -s "$out/$h.cpuinfo" ] && args+=("$h=$out/$h.cpuinfo"); done
+  [ ${#args[@]} -gt 0 ] && { "$cf" "${args[@]}" --local > "$out/cpu-features.md" 2>&1 || warn "cpu-features が失敗しました"; }
+fi
+ok "docs/inventory/ を更新しました"
+ls -1 "$out" >&2

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# isu-export-seed [outdir] — DB の全テーブルを JSON Lines で書き出す（インメモリ全書き換えの seed）
+#   必ず「初期状態」で取る: initialize（init.sh）直後、ベンチを流す前。
+#   出力: <outdir>/<table>.jsonl（既定 webapp/rust-mem/seed）。1行 = JSON_OBJECT(列名: 値)
+#   DATETIME は "YYYY-MM-DD HH:MM:SS.ffffff" 文字列、BLOB は "base64:type..:..." になるので型に注意。
+. "$(dirname "$0")/lib.sh"
+out="$ISU_ROOT/${1:-webapp/rust-mem/seed}"; mkdir -p "$out"
+[ -n "$ISU_DB_HOST" ] || die "ISU_DB_HOST が空です"
+isu_sh "$ISU_DB_HOST" "$ISU_DB_NAME" <<'EOS' | tar -xzf - -C "$out"
+DB=$1; D=$(mktemp -d)
+for t in $(sudo mysql -NBe 'show tables' "$DB"); do
+  cols=$(sudo mysql -NBe "select group_concat(concat('''', column_name, ''', \`', column_name, '\`') order by ordinal_position separator ', ') from information_schema.columns where table_schema='$DB' and table_name='$t'")
+  sudo mysql -NBr -e "select json_object($cols) from \`$t\`" "$DB" > "$D/$t.jsonl"
+done
+tar -C "$D" -czf - .
+EOS
+wc -l "$out"/*.jsonl | sort -nr | head -20 >&2
+ok "seed -> ${out#$ISU_ROOT/}"

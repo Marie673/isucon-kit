@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# isu-lock — デプロイ/ベンチの排他（ISU_LOCK_HOST 上の mkdir で取る。誰がどこから叩いても効く）
+#   isu-lock status
+#   isu-lock acquire [what] [--wait SECS]   取れるまで待つ（既定 0 = 取れなければ即失敗）
+#   isu-lock release
+#   isu-lock force-release                  持ち主が死んだときだけ。人間の判断で使う
+# 持ち主の名前は ISU_WHO（既定はブランチ名）。
+. "$(dirname "$0")/lib.sh"
+cmd=${1:-status}; shift || true
+case "$cmd" in
+  status) echo "lock: $(isu_lock_describe)" ;;
+  acquire)
+    what=${1:-manual}; wait=0
+    [ "${2:-}" = --wait ] && wait=${3:-600}
+    end=$(( $(date +%s) + wait ))
+    # 同じ持ち主の 2 本目のベンチ・再起動試験も通さない。2026-11-02 の ISUCON14 の練習で、手作業のコマンドが
+    # 動いたままベンチを 2 本重ねて起動し、同じ持ち主の名前で素通りした。片方の反映がもう片方の走行中に
+    # アプリを再起動し、ベンチの決済のポートも取り合って、2 本とも無効になった。前の作業が死んで残った
+    # ロックなら、isu-lock status で確かめてから release する。isu-deploy は lib の関数で入れ子を許している
+    if isu_lock_held_by_me; then die "既に保持しています（同じ持ち主の別の作業が動いていないか確かめる）: $(isu_lock_describe)"; fi
+    while ! isu_lock_try "$what"; do
+      [ "$(date +%s)" -lt "$end" ] || die "ロック取得失敗: $(isu_lock_describe)"
+      isu_wait_mark "ロック待ち: $(isu_lock_describe)"
+      sleep 5
+    done
+    isu_wait_clear
+    ok "lock acquired by $ISU_WHO ($what)" ;;
+  release) isu_lock_release && ok "released" ;;
+  force-release) warn "強制解除: $(isu_lock_describe)"; isu_ssh "$ISU_LOCK_HOST" "rm -rf $ISU_LOCK_DIR" ;;
+  *) die "usage: isu-lock status|acquire [what] [--wait SECS]|release|force-release" ;;
+esac

@@ -1,0 +1,20 @@
+Linux 6.8.0-1015-aws (host1) 	10/31/2026 	_x86_64_	(2 CPU)
+
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:20  1000      2001   40.00    5.00    0.00    0.00   45.00     0  app
+ 10:03:20   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:21  1000      2001   50.00    5.00    0.00    0.00   55.00     0  app
+ 10:03:21   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:22  1000      2001   60.00    5.00    0.00    0.00   65.00     0  app
+ 10:03:22   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:23  1000      2001   70.00    5.00    0.00    0.00   75.00     0  app
+ 10:03:23   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:24  1000      2001   80.00    5.00    0.00    0.00   85.00     0  app
+ 10:03:24   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres
+#      Time   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+ 10:03:25  1000      2001   90.00    5.00    0.00    0.00   95.00     0  app
+ 10:03:25   106      2002   10.00    2.00    0.00    0.00   12.00     1  postgres

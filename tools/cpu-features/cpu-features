@@ -1,0 +1,566 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""各台の CPU 機能（/proc/cpuinfo か lscpu の出力）を比べて、Markdown の表にする。
+
+    cpu-features host1=host1.cpuinfo host2=host2.cpuinfo
+    cpu-features --local host1.cpuinfo      # 手元の機械も足す
+    ssh host cat /proc/cpuinfo | cpu-features -
+
+サーバーには接続しない。入力はファイルか標準入力（-）だけ。
+入力の形式は自動で見分ける: /proc/cpuinfo、lscpu、macOS の sysctl（machdep.cpu / hw.optional）。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import platform
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Set
+
+X86 = "x86_64"
+ARM = "arm64"
+
+# ---------------------------------------------------------------------------
+# 機能の定義。(名前, 対象の ISA, 説明)
+# 値の意味: True = ある / False = 無い / None = その ISA に存在しない（n/a）
+# ---------------------------------------------------------------------------
+FEATURES = [
+    ("sha_ni", (X86, ARM), "SHA-1/SHA-256 の専用命令（ARM は sha2）"),
+    ("aes", (X86, ARM), "AES の専用命令（AES-NI）"),
+    ("pclmulqdq", (X86, ARM), "キャリーなし乗算。GCM・CRC に使う（ARM は pmull）"),
+    ("vaes", (X86,), "AES を 256/512 ビット幅で（vaes）"),
+    ("vpclmulqdq", (X86,), "pclmulqdq の幅広版"),
+    ("gfni", (X86,), "ガロア体の命令。バイト列処理・暗号の一部"),
+    ("sse4_2", (X86,), "crc32c 命令・文字列比較"),
+    ("avx2", (X86,), "256 ビットの整数 SIMD"),
+    ("avx512f", (X86,), "512 ビット SIMD の基本"),
+    ("avx512bw", (X86,), "512 ビットのバイト・ワード演算（文字列・画像）"),
+    ("avx512vl", (X86,), "AVX-512 を 128/256 ビット幅でも使う"),
+    ("avx512vbmi", (X86,), "バイトの並べ替え（base64・UTF-8 の SIMD 実装）"),
+    ("bmi2", (X86,), "ビット操作（pdep/pext）"),
+    ("neon", (ARM,), "ARM の SIMD（asimd）"),
+    ("crc32", (ARM,), "ARM の CRC32 命令"),
+]
+FEATURE_NAMES = [f[0] for f in FEATURES]
+FEATURE_ARCHS = {f[0]: f[1] for f in FEATURES}
+FEATURE_DESC = {f[0]: f[2] for f in FEATURES}
+
+# 生のフラグ名 → 上の名前。Linux のカーネル名と macOS の表記ゆれを寄せる
+ALIASES = {
+    "sha2": "sha_ni",
+    "sha": "sha_ni",  # macOS の machdep.cpu.leaf7_features
+    "pmull": "pclmulqdq",
+    "asimd": "neon",
+    "sse4.2": "sse4_2",
+    "avx1.0": "avx",
+    "avx512_vbmi": "avx512vbmi",
+}
+
+
+def normalize_flag(raw: str) -> str:
+    t = raw.strip().lower()
+    return ALIASES.get(t, t)
+
+
+# ---------------------------------------------------------------------------
+# 「機能が無いと重くなる処理」。needs は ISA ごとの必要な機能（全部あれば専用命令で速い）。
+# alt は、無い台で効く別の手（SIMD でまとめて計算など）の目安に表示する機能。
+# ---------------------------------------------------------------------------
+@dataclass
+class WorkItem:
+    name: str
+    needs: Dict[str, List[str]]
+    note: str
+    alt: Optional[Dict[str, List[str]]] = None
+    alt_text: str = ""
+
+
+WORK_ITEMS = [
+    WorkItem(
+        "SHA-1 / SHA-256 / HMAC（署名・ハッシュ・JWT・画像 URL の署名）",
+        {X86: ["sha_ni"], ARM: ["sha_ni"]},
+        "sha_ni が無いとソフト実装になり、1 回あたりが数倍遅い。",
+        {X86: ["avx2", "avx512f"]},
+        "複数の署名をまとめて計算する（マルチバッファ SHA-256）と速くなる",
+    ),
+    WorkItem(
+        "AES-GCM / AES-CBC（TLS・暗号化 Cookie・暗号化列）",
+        {X86: ["aes", "pclmulqdq"], ARM: ["aes", "pclmulqdq"]},
+        "aes か pclmulqdq が無いとソフト実装。vaes があると幅が広がってさらに速い。",
+    ),
+    WorkItem(
+        "JPEG・画像処理・SIMD 全般（リサイズ・エンコード・バイト列の検索）",
+        {X86: ["avx2"], ARM: ["neon"]},
+        "avx2 / avx512 が無いと SIMD 化されたライブラリが遅い経路に落ちる。",
+    ),
+    WorkItem(
+        "圧縮・CRC（gzip・zlib・crc32c・Brotli）",
+        {X86: ["pclmulqdq", "sse4_2"], ARM: ["pclmulqdq", "crc32"]},
+        "pclmulqdq / sse4_2（ARM は pmull / crc32）が無いと CRC と圧縮が遅い。",
+    ),
+    WorkItem(
+        "JSON・UTF-8 検証・base64 の SIMD 実装（simdjson 系）",
+        {X86: ["avx2"], ARM: ["neon"]},
+        "avx2 が無いと SSE 系に落ちる。avx512bw / avx512vbmi があるとさらに速い。",
+    ),
+]
+
+VERDICT_FAST = "fast"
+VERDICT_SLOW = "slow"
+VERDICT_NA = "n/a"
+
+
+# ---------------------------------------------------------------------------
+# ホスト
+# ---------------------------------------------------------------------------
+@dataclass
+class Host:
+    label: str
+    arch: str
+    model: str = ""
+    logical: Optional[int] = None
+    cores: Optional[int] = None
+    mhz: Optional[float] = None
+    flags: Set[str] = field(default_factory=set)
+    is_local: bool = False
+    source: str = ""
+
+    def feature(self, name: str) -> Optional[bool]:
+        if self.arch not in FEATURE_ARCHS[name]:
+            return None
+        return name in self.flags
+
+    def verdict(self, item: WorkItem) -> str:
+        need = item.needs.get(self.arch)
+        if need is None:
+            return VERDICT_NA
+        return VERDICT_FAST if all(n in self.flags for n in need) else VERDICT_SLOW
+
+    def missing(self, item: WorkItem) -> List[str]:
+        return [n for n in item.needs.get(self.arch, []) if n not in self.flags]
+
+
+class ParseError(Exception):
+    pass
+
+
+ARM_PARTS = {
+    ("0x41", "0xd0c"): "Neoverse-N1",
+    ("0x41", "0xd40"): "Neoverse-V1",
+    ("0x41", "0xd4f"): "Neoverse-V2",
+    ("0x61", None): "Apple",
+}
+
+
+def _freq_from_name(model: str) -> Optional[float]:
+    m = re.search(r"@\s*([\d.]+)\s*GHz", model)
+    return float(m.group(1)) * 1000 if m else None
+
+
+def _kv_lines(text: str, sep: str = ":") -> List[tuple]:
+    out = []
+    for line in text.splitlines():
+        if sep not in line:
+            continue
+        k, v = line.split(sep, 1)
+        out.append((k.strip(), v.strip()))
+    return out
+
+
+def detect_format(text: str) -> str:
+    if "machdep.cpu." in text or "hw.optional." in text:
+        return "sysctl"
+    if re.search(r"^\s*Architecture:\s", text, re.M):
+        return "lscpu"
+    if re.search(r"^processor\s*:", text, re.M):
+        return "cpuinfo"
+    raise ParseError("形式を判別できない（/proc/cpuinfo、lscpu、macOS の sysctl のどれでもない）")
+
+
+def parse_cpuinfo(text: str, label: str) -> Host:
+    blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
+    logical = 0
+    model = ""
+    mhz: Optional[float] = None
+    flags: Set[str] = set()
+    arch = ""
+    pairs: Set[tuple] = set()
+    cpu_cores: Optional[int] = None
+    sockets: Set[str] = set()
+    implementer = part = None
+    for b in blocks:
+        kv = _kv_lines(b)
+        d = {}
+        for k, v in kv:
+            d.setdefault(k.lower(), v)
+        if "processor" not in d:
+            continue
+        logical += 1
+        if not model and d.get("model name"):
+            model = d["model name"]
+        if mhz is None and d.get("cpu mhz"):
+            try:
+                mhz = float(d["cpu mhz"])
+            except ValueError:
+                pass
+        if "flags" in d and not flags:
+            arch = X86
+            flags = {normalize_flag(x) for x in d["flags"].split()}
+        if "features" in d and not flags:
+            arch = ARM
+            flags = {normalize_flag(x) for x in d["features"].split()}
+        if "physical id" in d and "core id" in d:
+            pairs.add((d["physical id"], d["core id"]))
+        if "physical id" in d:
+            sockets.add(d["physical id"])
+        if cpu_cores is None and d.get("cpu cores", "").isdigit():
+            cpu_cores = int(d["cpu cores"])
+        implementer = implementer or d.get("cpu implementer")
+        part = part or d.get("cpu part")
+    if not arch:
+        raise ParseError("flags / Features の行が無い（/proc/cpuinfo ではない？）")
+    if arch == ARM and not model:
+        model = ARM_PARTS.get((implementer, part)) or "ARM (implementer %s, part %s)" % (implementer, part)
+    cores = len(pairs) if pairs else (cpu_cores * max(len(sockets), 1) if cpu_cores else None)
+    if mhz is None:
+        mhz = _freq_from_name(model)
+    return Host(label, arch, model, logical or None, cores, mhz, flags, source="cpuinfo")
+
+
+def parse_lscpu(text: str, label: str) -> Host:
+    d = {}
+    for k, v in _kv_lines(text):
+        d.setdefault(k, v)
+    machine = d.get("Architecture", "")
+    arch = ARM if machine in ("aarch64", "arm64") else X86 if machine in ("x86_64", "i686", "amd64") else ""
+    if not arch:
+        raise ParseError("lscpu の Architecture が読めない: %r" % machine)
+    raw = d.get("Flags") or d.get("Features") or ""
+    flags = {normalize_flag(x) for x in raw.split()}
+    model = d.get("Model name", "")
+    logical = int(d["CPU(s)"]) if d.get("CPU(s)", "").isdigit() else None
+    cores = None
+    if d.get("Core(s) per socket", "").isdigit():
+        cores = int(d["Core(s) per socket"]) * (int(d["Socket(s)"]) if d.get("Socket(s)", "").isdigit() else 1)
+    mhz: Optional[float] = None
+    for key in ("CPU max MHz", "CPU MHz"):
+        try:
+            mhz = float(d[key])
+            break
+        except (KeyError, ValueError):
+            pass
+    if mhz is None:
+        mhz = _freq_from_name(model)
+    return Host(label, arch, model, logical, cores, mhz, flags, source="lscpu")
+
+
+def parse_sysctl(text: str, label: str) -> Host:
+    d = {}
+    for k, v in _kv_lines(text):
+        d.setdefault(k, v)
+    flags: Set[str] = set()
+    is_arm = any(k.startswith("hw.optional.arm") for k in d) or d.get("hw.optional.arm64") == "1"
+    model = d.get("machdep.cpu.brand_string", "")
+    if is_arm:
+        arm_map = {
+            "FEAT_SHA256": "sha_ni",
+            "FEAT_AES": "aes",
+            "FEAT_PMULL": "pclmulqdq",
+            "FEAT_CRC32": "crc32",
+            "AdvSIMD": "neon",
+        }
+        for k, v in d.items():
+            if v != "1":
+                continue
+            tail = k.rsplit(".", 1)[-1]
+            if k.startswith("hw.optional.") and tail in arm_map:
+                flags.add(arm_map[tail])
+            elif k == "hw.optional.neon":
+                flags.add("neon")
+        arch = ARM
+    else:
+        for key in ("machdep.cpu.features", "machdep.cpu.leaf7_features", "machdep.cpu.extfeatures"):
+            flags |= {normalize_flag(x) for x in d.get(key, "").split()}
+        arch = X86
+
+    def num(*keys: str) -> Optional[int]:
+        for k in keys:
+            if d.get(k, "").isdigit():
+                return int(d[k])
+        return None
+
+    logical = num("hw.logicalcpu", "hw.ncpu", "machdep.cpu.thread_count")
+    cores = num("hw.physicalcpu", "machdep.cpu.core_count")
+    mhz = None
+    if d.get("hw.cpufrequency", "").isdigit():
+        mhz = int(d["hw.cpufrequency"]) / 1e6
+    if mhz is None:
+        mhz = _freq_from_name(model)
+    return Host(label, arch, model, logical, cores, mhz, flags, source="sysctl")
+
+
+PARSERS: Dict[str, Callable[[str, str], Host]] = {
+    "cpuinfo": parse_cpuinfo,
+    "lscpu": parse_lscpu,
+    "sysctl": parse_sysctl,
+}
+
+
+def parse_text(text: str, label: str) -> Host:
+    return PARSERS[detect_format(text)](text, label)
+
+
+# ---------------------------------------------------------------------------
+# 手元の機械
+# ---------------------------------------------------------------------------
+LOCAL_SYSCTL = ["sysctl", "machdep.cpu", "hw.optional", "hw.ncpu", "hw.physicalcpu", "hw.logicalcpu", "hw.model"]
+
+
+def read_local(
+    system: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess"] = subprocess.run,
+    read: Callable[[str], str] = lambda p: Path(p).read_text(),
+) -> Host:
+    system = system or platform.system()
+    if system == "Darwin":
+        # 知らない名前があると終了コードが非 0 になるので、出力があれば使う
+        r = run(LOCAL_SYSCTL, capture_output=True, text=True)
+        if not r.stdout.strip():
+            raise ParseError("sysctl の出力が空")
+        h = parse_sysctl(r.stdout, "local")
+    elif system == "Linux":
+        h = parse_cpuinfo(read("/proc/cpuinfo"), "local")
+    else:
+        raise ParseError("--local は macOS と Linux だけ対応（今: %s）" % system)
+    h.is_local = True
+    return h
+
+
+# ---------------------------------------------------------------------------
+# 比較
+# ---------------------------------------------------------------------------
+def analyze(hosts: Sequence[Host]) -> Dict[str, object]:
+    servers = [h for h in hosts if not h.is_local]
+    locals_ = [h for h in hosts if h.is_local]
+    warnings: List[str] = []  # 台どうしの差
+    common_missing: List[str] = []  # 全部の台で専用命令が無い
+    local_warnings: List[str] = []  # 手元との差
+
+    for item in WORK_ITEMS:
+        fast = [h for h in servers if h.verdict(item) == VERDICT_FAST]
+        slow = [h for h in servers if h.verdict(item) == VERDICT_SLOW]
+        if fast and slow:
+            names = ", ".join(h.label for h in slow)
+            ok = ", ".join(h.label for h in fast)
+            miss = sorted({m for h in slow for m in h.missing(item)})
+            text = "**%s**: %s は %s が無く遅い。%s は専用命令で速い。同じ処理でも台によって速さが変わる。" % (
+                item.name, names, " / ".join(miss), ok)
+            if item.alt_text:
+                extra = _alt_status(slow, item)
+                if extra:
+                    text += " %s（%s）。" % (item.alt_text, extra)
+            warnings.append(text)
+        elif slow and not fast:
+            names = ", ".join(h.label for h in slow)
+            text = "%s: 全部の台（%s）で専用命令が無い。" % (item.name, names)
+            if item.alt_text:
+                extra = _alt_status(slow, item)
+                if extra:
+                    text += " %s（%s）。" % (item.alt_text, extra)
+            common_missing.append(text)
+
+    archs = {h.arch for h in servers}
+    for lo in locals_:
+        if servers and archs != {lo.arch}:
+            local_warnings.append(
+                "手元（%s）は %s、台は %s。AVX2 / AVX-512 は手元に無く（SIMD は NEON）、SIMD まわりの測定は台の結果と別物になる。"
+                % (lo.label, lo.arch, " / ".join(sorted(archs)))
+            )
+        for item in WORK_ITEMS:
+            lv = lo.verdict(item)
+            diff = [h for h in servers if {lv, h.verdict(item)} == {VERDICT_FAST, VERDICT_SLOW}]
+            if diff:
+                names = ", ".join(h.label for h in diff)
+                local_warnings.append(
+                    "**%s**: 手元は「%s」、%s は「%s」。効き目が本番と逆に出る。" % (
+                        item.name, _verdict_word(lv), names, _verdict_word(diff[0].verdict(item)))
+                )
+
+    return {"warnings": warnings, "common_missing": common_missing, "local_warnings": local_warnings}
+
+
+def _verdict_word(v: str) -> str:
+    return {VERDICT_FAST: "専用命令で速い", VERDICT_SLOW: "ソフト実装で遅い", VERDICT_NA: "対象外"}[v]
+
+
+def _alt_status(slow_hosts: Sequence[Host], item: WorkItem) -> str:
+    parts = []
+    for h in slow_hosts:
+        names = (item.alt or {}).get(h.arch)
+        if not names:
+            continue
+        have = ", ".join("%s=%s" % (n, "あり" if n in h.flags else "なし") for n in names)
+        parts.append("%s: %s" % (h.label, have))
+    return " / ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Markdown
+# ---------------------------------------------------------------------------
+def _esc(s: str) -> str:
+    return s.replace("|", "\\|")
+
+
+def _cell(v: Optional[bool]) -> str:
+    if v is None:
+        return "n/a"
+    return "yes" if v else "**no**"
+
+
+def _verdict_cell(h: Host, item: WorkItem) -> str:
+    v = h.verdict(item)
+    if v == VERDICT_NA:
+        return "n/a"
+    if v == VERDICT_FAST:
+        return "速い"
+    return "**遅い**（%s なし）" % ", ".join(h.missing(item))
+
+
+def _mhz(h: Host) -> str:
+    return "%d MHz" % round(h.mhz) if h.mhz else "不明"
+
+
+def render_markdown(hosts: Sequence[Host]) -> str:
+    res = analyze(hosts)
+    lines: List[str] = ["# CPU 機能の比較", ""]
+    if res["warnings"]:
+        lines += ["## 警告: 台によって速さが変わる処理", ""]
+        lines += ["- " + w for w in res["warnings"]]  # type: ignore[union-attr]
+        lines.append("")
+    if res["common_missing"]:
+        lines += ["## 注意: 全部の台で専用命令が無い処理", ""]
+        lines += ["- " + w for w in res["common_missing"]]  # type: ignore[union-attr]
+        lines.append("")
+    if res["local_warnings"]:
+        lines += ["## 警告: 手元との差", ""]
+        lines += ["- " + w for w in res["local_warnings"]]  # type: ignore[union-attr]
+        lines.append("")
+    if not (res["warnings"] or res["common_missing"] or res["local_warnings"]):
+        lines += ["差による警告は無い。", ""]
+
+    lines += ["## 台", "", "| 台 | ISA | モデル | 論理 CPU | コア | 周波数 |", "| --- | --- | --- | ---: | ---: | ---: |"]
+    for h in hosts:
+        label = h.label + ("（手元）" if h.is_local else "")
+        lines.append("| %s | %s | %s | %s | %s | %s |" % (
+            _esc(label), h.arch, _esc(h.model or "不明"), h.logical or "?", h.cores or "?", _mhz(h)))
+    lines.append("")
+
+    lines += ["## 機能", "", "n/a はその ISA に無い機能（x86 の AVX は ARM に無い、など）。", ""]
+    lines.append("| 機能 | " + " | ".join(_esc(h.label) for h in hosts) + " | 意味 |")
+    lines.append("| --- |" + " :---: |" * len(hosts) + " --- |")
+    for name in FEATURE_NAMES:
+        cells = [_cell(h.feature(name)) for h in hosts]
+        lines.append("| %s | %s | %s |" % (name, " | ".join(cells), _esc(FEATURE_DESC[name])))
+    lines.append("")
+
+    lines += ["## 機能が無いと重くなる処理", ""]
+    lines.append("| 処理 | " + " | ".join(_esc(h.label) for h in hosts) + " | 備考 |")
+    lines.append("| --- |" + " :---: |" * len(hosts) + " --- |")
+    for item in WORK_ITEMS:
+        cells = [_verdict_cell(h, item) for h in hosts]
+        lines.append("| %s | %s | %s |" % (_esc(item.name), " | ".join(cells), _esc(item.note)))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_json(hosts: Sequence[Host]) -> str:
+    res = analyze(hosts)
+    out = {
+        "hosts": [
+            {
+                "label": h.label,
+                "arch": h.arch,
+                "model": h.model,
+                "logical_cpus": h.logical,
+                "cores": h.cores,
+                "mhz": h.mhz,
+                "is_local": h.is_local,
+                "features": {n: h.feature(n) for n in FEATURE_NAMES},
+                "verdicts": {i.name: h.verdict(i) for i in WORK_ITEMS},
+            }
+            for h in hosts
+        ],
+        "warnings": res["warnings"],
+        "common_missing": res["common_missing"],
+        "local_warnings": res["local_warnings"],
+    }
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def load_inputs(specs: Sequence[str], stdin_text: Optional[Callable[[], str]] = None) -> List[Host]:
+    hosts: List[Host] = []
+    used_stdin = False
+    for spec in specs:
+        label, path = "", spec
+        if "=" in spec and not Path(spec).exists():
+            label, _, path = spec.partition("=")
+        if not path:
+            raise ParseError("入力の指定が空: %r" % spec)
+        if path == "-":
+            if used_stdin:
+                raise ParseError("標準入力は 1 回だけ")
+            used_stdin = True
+            text = (stdin_text or sys.stdin.read)()
+            label = label or "stdin"
+        else:
+            p = Path(path)
+            if not p.is_file():
+                raise ParseError("ファイルが無い: %s" % path)
+            text = p.read_text()
+            label = label or p.name.split(".")[0]
+        try:
+            hosts.append(parse_text(text, label))
+        except ParseError as e:
+            raise ParseError("%s: %s" % (label, e))
+    return hosts
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="cpu-features",
+        description="各台の /proc/cpuinfo か lscpu の出力から、CPU 機能の差を Markdown の表にする。サーバーへは接続しない。",
+    )
+    ap.add_argument("inputs", nargs="*", metavar="[LABEL=]FILE", help="cpuinfo / lscpu / sysctl の出力。- で標準入力。ラベル省略時はファイル名の最初の部分")
+    ap.add_argument("--local", action="store_true", help="手元の機械（macOS は sysctl、Linux は /proc/cpuinfo）を足す")
+    ap.add_argument("--json", action="store_true", help="Markdown ではなく JSON で出す")
+    args = ap.parse_args(argv)
+    if not args.inputs and not args.local:
+        ap.error("入力ファイルか --local が要る")
+    try:
+        hosts = load_inputs(args.inputs)
+        if args.local:
+            hosts.append(read_local())
+    except ParseError as e:
+        print("cpu-features: %s" % e, file=sys.stderr)
+        return 2
+    labels = [h.label for h in hosts]
+    dup = {x for x in labels if labels.count(x) > 1}
+    if dup:
+        print("cpu-features: ラベルが重複している: %s（LABEL=FILE で付ける）" % ", ".join(sorted(dup)), file=sys.stderr)
+        return 2
+    print(render_json(hosts) if args.json else render_markdown(hosts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

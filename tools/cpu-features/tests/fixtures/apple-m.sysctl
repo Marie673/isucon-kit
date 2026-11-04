@@ -1,0 +1,14 @@
+machdep.cpu.core_count: 8
+machdep.cpu.thread_count: 8
+machdep.cpu.brand_string: Apple M2
+hw.optional.arm.FEAT_CRC32: 1
+hw.optional.arm.FEAT_SHA256: 1
+hw.optional.arm.FEAT_SHA512: 1
+hw.optional.arm.FEAT_SHA1: 1
+hw.optional.arm.FEAT_AES: 1
+hw.optional.arm.FEAT_PMULL: 1
+hw.optional.arm.AdvSIMD: 1
+hw.ncpu: 8
+hw.physicalcpu: 8
+hw.logicalcpu: 8
+hw.model: Mac17,9

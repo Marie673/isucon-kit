@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# isu-deploy [--no-build] [--allow-dirty] [--hosts "isu1 isu2"]
+#   サーバへの変更はすべてここを通す（repo -> artifact -> deploy の一本道）。
+#   1. ロック確認（持っていなければ取得を試み、自分で取った場合は終了時に解放）
+#   2. 手元でビルド（bin/isu-build）
+#   3. 各ホストへ: hosts/common/ と hosts/<host>/ を / に重ねる（etc は root 所有、home/isucon は isucon 所有）
+#   4. アプリホストへ: バイナリ（置き換えは mv で原子的に）と ISU_DEPLOY_PATHS
+#   5. daemon-reload / nginx -t && reload / my.cnf が変わったときだけ mysql restart / サービス restart
+#   6. ヘルスチェックと、デプロイ記録（サーバの ~/.isu-deployed、git tag deploy/<時刻>）
+. "$(dirname "$0")/lib.sh"
+build=1; dirty_ok=0; hosts="$ISU_HOSTS"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-build) build=0 ;;
+    --allow-dirty) dirty_ok=1 ;;
+    --hosts) hosts="$2"; shift ;;
+    *) die "unknown option: $1" ;;
+  esac; shift
+done
+
+if [ $dirty_ok = 0 ] && [ -n "$(git -C "$ISU_ROOT" status --porcelain --untracked-files=no -- . ':!results' ':!docs' ':!.dots')" ]; then
+  die "未コミットの変更があります。結果をコミットに紐付けるため、コミットしてからデプロイしてください（--allow-dirty で無視）"
+fi
+sha=$(git -C "$ISU_ROOT" rev-parse --short HEAD); branch=$(git -C "$ISU_ROOT" branch --show-current)
+
+# 永続化を弱める設定（innodb_flush_log_at_trx_commit=2 など）は、決まりの記録が無ければ反映しない
+# （isucon-kit の tools/flags があるとき）。追試に触れるので、人間の承認と再起動試験が要る
+fl="$ISU_ROOT/tools/flags/flags"
+if [ -x "$fl" ]; then
+  # shellcheck disable=SC2086
+  dur=$("$fl" durability --conf "$ISU_ROOT/hosts" $(for p in $ISU_DEPLOY_PATHS; do printf -- '--conf %s ' "$ISU_ROOT/$p"; done) \
+    --decisions "$ISU_ROOT/docs/DECISIONS.md") \
+    || { printf '%s\n' "$dur" >&2; die "永続化を弱める設定に、docs/DECISIONS.md の記録がありません（上の一覧）。人間の承認と再起動試験の結果を書いてから反映してください"; }
+fi
+
+own_lock=0
+if ! isu_lock_held_by_me; then
+  isu_lock_try "deploy $sha" || die "ロックが取れません: $(isu_lock_describe)"
+  own_lock=1
+fi
+trap 'if [ $own_lock = 1 ]; then isu_lock_release; fi' EXIT
+
+[ $build = 1 ] && "$ISU_ROOT/bin/isu-build"
+art="$ISU_ROOT/.isu-artifact/$ISU_BIN_NAME"
+
+pack() { # $1=dir $2..=paths  — macOS の拡張属性を入れずに tar
+  local d="$1"; shift
+  COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$d" -cf - "$@"
+}
+tree_hash() { [ -d "$1" ] && (cd "$1" && find . -type f | LC_ALL=C sort | xargs shasum 2>/dev/null | shasum | cut -c1-16) || echo none; }
+
+for h in $hosts; do
+  [ -n "$(isu_ip "$h")" ] || continue
+  log "$h: deploy $sha ($branch)"
+  for layer in common "$h"; do
+    d="$ISU_ROOT/hosts/$layer"
+    # /etc は一度一時ディレクトリに展開してから cp で重ねる。既にあるファイルは持ち主と権限を保つ
+    # （tar で直接 / に展開すると root の持ち物で作り直され、PostgreSQL が pg_hba.conf を読めず再起動で上がらなかった）
+    [ -d "$d/etc" ] && pack "$d" etc | isu_ssh "$h" 't=$(mktemp -d) && sudo tar -C "$t" --no-same-owner -xf - && sudo cp -rT "$t/etc" /etc && sudo rm -rf "$t"'
+    [ -d "$d/home/isucon" ] && pack "$d/home/isucon" . | isu_ssh "$h" "tar -C /home/isucon -xf - 2>/dev/null"
+  done
+  if in_list "$h" $ISU_APP_HOSTS; then
+    if [ "$ISU_LANG" != none ]; then
+      [ -f "$art" ] || die "成果物がありません: $art"
+      isu_scp "$art" "$h:$ISU_REMOTE_BIN.new"
+      isu_ssh "$h" "chmod +x $ISU_REMOTE_BIN.new && mv -f $ISU_REMOTE_BIN.new $ISU_REMOTE_BIN"
+    fi
+    # shellcheck disable=SC2086
+    [ -n "$ISU_DEPLOY_PATHS" ] && pack "$ISU_ROOT" $ISU_DEPLOY_PATHS | isu_ssh "$h" "tar -C /home/isucon -xf - 2>/dev/null"
+  fi
+  mysql_hash=$(tree_hash "$ISU_ROOT/hosts/$h/etc/mysql")
+  sysctl_hash=$(tree_hash "$ISU_ROOT/hosts/$h/etc/sysctl.d")
+  pg_hash=$(tree_hash "$ISU_ROOT/hosts/$h/etc/postgresql")
+  isu_sh "$h" "$mysql_hash" "$sysctl_hash" "$(isu_services "$h")" "$sha|$branch|$ISU_WHO|$(date '+%F %T')" "$pg_hash" <<'EOS'
+set -u
+mysql_hash=$1 sysctl_hash=$2 services=$3 stamp=$4 pg_hash=$5
+sudo systemctl daemon-reload
+if [ "$sysctl_hash" != none ] && [ "$(cat ~/.isu-hash-sysctl 2>/dev/null)" != "$sysctl_hash" ]; then
+  sudo sysctl --system >/dev/null && echo "$sysctl_hash" > ~/.isu-hash-sysctl && echo "  sysctl: applied"
+fi
+if [ "$mysql_hash" != none ] && [ "$(cat ~/.isu-hash-mysql 2>/dev/null)" != "$mysql_hash" ]; then
+  if systemctl is-enabled mysql >/dev/null 2>&1; then
+    sudo systemctl restart mysql && echo "$mysql_hash" > ~/.isu-hash-mysql && echo "  mysql: restarted (my.cnf changed)"
+  fi
+fi
+if [ "$pg_hash" != none ] && [ "$(cat ~/.isu-hash-pg 2>/dev/null)" != "$pg_hash" ]; then
+  if systemctl is-enabled postgresql >/dev/null 2>&1; then
+    sudo systemctl restart postgresql && echo "$pg_hash" > ~/.isu-hash-pg && echo "  postgresql: restarted (conf changed)"
+  fi
+fi
+if systemctl is-enabled nginx >/dev/null 2>&1; then
+  sudo nginx -t -q && sudo systemctl reload nginx || { echo "  nginx: 設定エラー"; exit 1; }
+fi
+# enable も付ける（再起動の後に手作業なしで上がること）
+[ -n "$services" ] && sudo systemctl enable -q $services && sudo systemctl restart $services
+for s in $services; do printf '  %s: %s\n' "$s" "$(systemctl is-active $s)"; done
+echo "$stamp" > ~/.isu-deployed
+EOS
+done
+
+# ヘルスチェック（nginx ホスト上からローカルに）
+if [ -n "$ISU_NGINX_HOST" ]; then
+  sleep 1
+  code=$(isu_ssh "$ISU_NGINX_HOST" "curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve $ISU_TARGET_HOST:443:127.0.0.1 https://$ISU_TARGET_HOST$ISU_HEALTH_PATH" || true)
+  case "$code" in 2*|3*) ok "health $ISU_HEALTH_PATH -> $code" ;; *) warn "health $ISU_HEALTH_PATH -> ${code}（journalctl を確認）" ;; esac
+fi
+tag="deploy/$(date +%m%d-%H%M%S)"
+git -C "$ISU_ROOT" tag "$tag" HEAD 2>/dev/null || true
+echo "$(date '+%F %T') $sha $branch $ISU_WHO $tag" >> "$ISU_STATE/deploys.log"
+ok "deployed $sha ($tag)"

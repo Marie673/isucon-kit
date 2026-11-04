@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# isu-build — 手元（Mac）でサーバ向けバイナリを作る -> .isu-artifact/<ISU_BIN_NAME>
+#   go   : GOOS=linux CGO_ENABLED=0 でクロスコンパイル
+#   rust : cargo zigbuild（glibc 2.35 指定。musl は malloc が遅いので使わない）
+#   none : ビルドしない（スクリプト言語など）
+#   custom: ISU_BUILD_CMD を実行。成果物は $OUT/<ISU_BIN_NAME> に置くこと
+. "$(dirname "$0")/lib.sh"
+OUT="$ISU_ROOT/.isu-artifact"; mkdir -p "$OUT"
+src="$ISU_ROOT/$ISU_SRC_DIR"
+t0=$(date +%s)
+case "$ISU_LANG" in
+  go)
+    (cd "$src" && GOOS=linux GOARCH="$ISU_ARCH" CGO_ENABLED=0 go build -trimpath -o "$OUT/$ISU_BIN_NAME" .) ;;
+  rust)
+    case "$ISU_ARCH" in amd64) triple=x86_64-unknown-linux-gnu;; arm64) triple=aarch64-unknown-linux-gnu;; esac
+    command -v cargo-zigbuild >/dev/null || die "cargo-zigbuild がありません（isucon-kit の setup/mac.sh）"
+    rustup target list --installed | grep -qx "$triple" || rustup target add "$triple"
+    (cd "$src" && cargo zigbuild --release --target "$triple.2.35" -q)
+    cp "$src/target/$triple/release/$ISU_BIN_NAME" "$OUT/$ISU_BIN_NAME" ;;
+  none) exit 0 ;;
+  custom) OUT="$OUT" bash -c "$ISU_BUILD_CMD" ;;
+  *) die "ISU_LANG が不正: $ISU_LANG" ;;
+esac
+ok "build $(basename "$OUT")/$ISU_BIN_NAME ($(( $(date +%s) - t0 ))s)"

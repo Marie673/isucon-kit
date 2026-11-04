@@ -1,0 +1,3 @@
+# Codex のプロジェクト設定（信頼済みプロジェクトで有効）。記憶は docs/ に集約する
+[features]
+memories = false

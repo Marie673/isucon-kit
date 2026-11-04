@@ -1,0 +1,758 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""bench-window: ベンチの「窓」だけを切り出して nginx のアクセスログを集計する。
+
+詰まりはベンチの最後の山にしか出ない。走行全体の平均では見えないので、窓を決めて、
+秒単位のタイムライン・エンドポイント別・窓の内外の比較を Markdown で出す。
+読み取りだけ（ログを読んで標準出力に書く）。サーバーには接続しない。
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import math
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, time as dtime, timedelta, timezone, tzinfo
+from pathlib import Path
+from typing import IO, NamedTuple
+
+# ---------------------------------------------------------------- 入力の読み取り
+
+# キーの別名。左ほど優先（msec があれば ISO より精度が高いので先に見る）。
+TIME_KEYS = ("msec", "time_iso8601", "time", "ts", "timestamp", "@timestamp", "time_local")
+RT_KEYS = ("reqtime", "request_time", "req_time", "rt", "response_time", "duration")
+URI_KEYS = ("uri", "request_uri", "path", "url", "request_path")
+METHOD_KEYS = ("method", "request_method", "verb")
+STATUS_KEYS = ("status", "status_code", "code")
+REQUEST_KEYS = ("request", "req")
+
+
+class Rec(NamedTuple):
+    t: float  # epoch 秒
+    host: str
+    method: str
+    path: str  # クエリを除いたパス
+    status: int
+    rt: float | None  # 秒。無ければ None
+
+
+def parse_tz(s: str) -> tzinfo:
+    s = s.strip()
+    if s.upper() in ("Z", "UTC"):
+        return timezone.utc
+    if s.upper() == "JST":
+        return timezone(timedelta(hours=9))
+    m = re.fullmatch(r"([+-])(\d{1,2}):?(\d{2})?", s)
+    if not m:
+        raise ValueError(f"タイムゾーンを読めない: {s!r}（例: +09:00, UTC, JST）")
+    off = timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+    return timezone(-off if m.group(1) == "-" else off)
+
+
+_NUM = re.compile(r"\d+(\.\d+)?")
+
+
+def parse_time(s: str, tz: tzinfo) -> float | None:
+    """ISO 8601・nginx の time_local・epoch（秒/ミリ秒）を epoch 秒にする。時刻だけのものは None。"""
+    s = s.strip().strip('"[]')
+    if not s:
+        return None
+    if _NUM.fullmatch(s):
+        v = float(s)
+        return v / 1000.0 if v > 1e11 else v
+    try:
+        return datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp()
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.timestamp()
+
+
+_CLOCK = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?")
+
+
+def clock_to_epoch(s: str, day, tz: tzinfo) -> float | None:
+    """HH:MM[:SS[.f]] を、day の日付・tz の時刻として epoch 秒にする。"""
+    m = _CLOCK.fullmatch(s.strip())
+    if not m:
+        return None
+    h, mi, sec = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    frac = float(m.group(4) or 0)
+    dt = datetime.combine(day, dtime(h, mi, sec), tzinfo=tz)
+    return dt.timestamp() + frac
+
+
+def parse_line(line: str) -> dict[str, str] | None:
+    """LTSV か JSON の 1 行を {key: str} にする。読めなければ None。"""
+    if not line.strip():
+        return None
+    if line.lstrip().startswith("{"):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(d, dict):
+            return None
+        return {k: ("" if v is None else str(v)) for k, v in d.items()}
+    d: dict[str, str] = {}
+    for field in line.rstrip("\n").split("\t"):
+        k, sep, v = field.partition(":")
+        if sep and k:
+            d[k] = v
+    return d or None
+
+
+def first(d: dict[str, str], keys: tuple[str, ...]) -> str | None:
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "-"):
+            return v
+    return None
+
+
+def to_rec(d: dict[str, str], label: str, tz: tzinfo, host_key: str | None) -> Rec | None:
+    t = None
+    for k in TIME_KEYS:
+        v = d.get(k)
+        if v:
+            t = parse_time(v, tz)
+            if t is not None:
+                break
+    if t is None:
+        return None
+    method = first(d, METHOD_KEYS)
+    uri = first(d, URI_KEYS)
+    if uri is None or method is None:
+        req = first(d, REQUEST_KEYS)  # "GET /x?y=1 HTTP/1.1"
+        if req:
+            parts = req.split()
+            if len(parts) >= 2:
+                method = method or parts[0]
+                uri = uri or parts[1]
+    if uri is None:
+        return None
+    path = uri.split("?", 1)[0]
+    try:
+        status = int(first(d, STATUS_KEYS) or 0)
+    except ValueError:
+        status = 0
+    rt_s = first(d, RT_KEYS)
+    try:
+        rt = float(rt_s) if rt_s is not None else None
+    except ValueError:
+        rt = None
+    host = label
+    if host_key and d.get(host_key):
+        host = d[host_key]
+    return Rec(t, host, (method or "-").upper(), path, status, rt)
+
+
+def open_text(path: str) -> IO[str]:
+    if path == "-":
+        return sys.stdin
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def split_label(spec: str) -> tuple[str | None, str]:
+    """`label=path` を (label, path) にする。そのパスが実在すれば全体をパスとして扱う。"""
+    if os.path.exists(spec):
+        return None, spec
+    m = re.fullmatch(r"([\w.\-]+)=(.+)", spec)
+    if m:
+        return m.group(1), m.group(2)
+    return None, spec
+
+
+def default_labels(paths: list[str]) -> list[str]:
+    stems = [Path(p).name.split(".")[0] for p in paths]
+    if len(set(stems)) == len(stems):
+        return stems
+    parents = [Path(p).resolve().parent.name for p in paths]  # 台ごとのディレクトリを使う
+    return parents if len(set(parents)) == len(parents) else [f"{p}#{i + 1}" for i, p in enumerate(parents)]
+
+
+def load_logs(specs: list[str], host_labels: list[str], tz: tzinfo, host_key: str | None):
+    items: list[tuple[str | None, str]] = [split_label(s) for s in specs]
+    paths = [p for _, p in items]
+    auto = default_labels(paths)
+    labels: list[str] = []
+    for i, (lab, _) in enumerate(items):
+        if lab:
+            labels.append(lab)
+        elif i < len(host_labels):
+            labels.append(host_labels[i])
+        else:
+            labels.append(auto[i])
+    recs: list[Rec] = []
+    stats: list[tuple[str, int, int]] = []  # (label, 読めた行, 読めなかった行)
+    for label, path in zip(labels, paths):
+        ok = bad = 0
+        with open_text(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                d = parse_line(line)
+                r = to_rec(d, label, tz, host_key) if d else None
+                if r is None:
+                    bad += 1
+                else:
+                    ok += 1
+                    recs.append(r)
+        stats.append((label, ok, bad))
+    return recs, stats
+
+
+# ---------------------------------------------------------------- CPU の読み取り
+
+_AMPM = ("AM", "PM")
+
+
+def split_sysstat(line: str) -> tuple[str | None, list[str]]:
+    """sysstat の 1 行を (24 時間表記の HH:MM:SS, トークン) にする。先頭が時刻でなければ (None, ...)。"""
+    toks = line.split()
+    if not toks or not re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", toks[0]):
+        return None, toks
+    clock = toks[0]
+    rest = toks[1:]
+    if rest and rest[0] in _AMPM:
+        h, m, s = (int(x) for x in clock.split(":"))
+        h = h % 12 + (12 if rest[0] == "PM" else 0)
+        clock = f"{h:02d}:{m:02d}:{s:02d}"
+        rest = rest[1:]
+    return clock, [clock] + rest
+
+
+def banner_date(line: str):
+    """`Linux ... (host) 10/31/2026 _x86_64_ (4 CPU)` から日付を取る。"""
+    m = re.search(r"\s(\d{4})-(\d{2})-(\d{2})\s", line + " ")
+    if m:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    m = re.search(r"\s(\d{2})/(\d{2})/(\d{4})\s", line + " ")
+    if m:
+        return datetime(int(m.group(3)), int(m.group(1)), int(m.group(2))).date()
+    m = re.search(r"\s(\d{2})/(\d{2})/(\d{2})\s", line + " ")
+    if m:
+        return datetime(2000 + int(m.group(3)), int(m.group(1)), int(m.group(2))).date()
+    return None
+
+
+def load_cpu(spec: str, tz: tzinfo, ref_day, cores_opt: int | None):
+    """CPU の時系列を [(epoch, host, 使用率 %)] にする。mpstat・pidstat・CSV（ts,host,cpu）を自動判別。"""
+    label, path = split_label(spec)
+    stem = Path(path).name.split(".")[0]
+    with open_text(path) as f:
+        lines = f.read().splitlines()
+    head = "\n".join(lines[:40])
+    out: list[tuple[float, str, float]] = []
+    if "%idle" in head or "%CPU" in head:
+        is_mpstat = "%idle" in head
+        host = label
+        day = ref_day
+        cores = cores_opt
+        for ln in lines[:5]:
+            m = re.match(r"Linux\s+\S+\s+\(([^)]+)\)", ln)
+            if m:
+                host = host or m.group(1)
+                day = banner_date(ln) or day
+                mc = re.search(r"\((\d+)\s+CPU\)", ln)
+                if mc and cores is None:
+                    cores = int(mc.group(1))
+        host = host or stem
+        col = None
+        sums: dict[str, float] = defaultdict(float)
+        order: list[str] = []
+        for ln in lines:
+            raw = ln.split()
+            # pidstat -h の見出しは `#      Time   UID  PID ... %CPU ...` で、データ行の先頭は時刻（HH:MM:SS か epoch 秒）
+            if not is_mpstat and raw and raw[0] == "#" and "%CPU" in raw:
+                col = raw.index("%CPU") - 1
+                continue
+            if not is_mpstat and raw and re.fullmatch(r"\d{9,11}", raw[0]):
+                if col is None or len(raw) <= col:
+                    continue
+                try:
+                    v = float(raw[col])
+                except ValueError:
+                    continue
+                key = "@" + raw[0]
+                if key not in sums:
+                    order.append(key)
+                sums[key] += v
+                continue
+            clock, toks = split_sysstat(ln)
+            if clock is None:
+                continue
+            if is_mpstat and "%idle" in toks:
+                col = toks.index("%idle")
+                continue
+            if not is_mpstat and "%CPU" in toks:
+                col = toks.index("%CPU")
+                continue
+            if col is None or len(toks) <= col:
+                continue
+            try:
+                v = float(toks[col])
+            except ValueError:
+                continue
+            if is_mpstat:
+                if toks[1] != "all":
+                    continue
+                t = clock_to_epoch(clock, day, tz)
+                out.append((t, host, 100.0 - v))
+            else:
+                if clock not in sums:
+                    order.append(clock)
+                sums[clock] += v
+        if not is_mpstat:
+            if cores is None:
+                print("警告: pidstat のコア数が分からない（バナーに (N CPU) が無い）。--cpu-cores で指定すると全コア平均 % になる。"
+                      "今は 100 = 1 コアの合計のまま", file=sys.stderr)
+                cores = 1
+            for clock in order:
+                t = float(clock[1:]) if clock.startswith("@") else clock_to_epoch(clock, day, tz)
+                out.append((t, host, sums[clock] / cores))
+        return out
+    # CSV
+    rows = [r for r in csv.reader(lines) if r and any(c.strip() for c in r)]
+    if not rows:
+        return out
+    c0 = rows[0][0].strip()
+    has_header = parse_time(c0, tz) is None and not _CLOCK.fullmatch(c0)
+    cols = {"ts": 0, "host": 1, "cpu": 2}
+    if has_header:
+        names = [c.strip().lower() for c in rows[0]]
+        for want, aliases in (("ts", ("ts", "time", "timestamp")), ("host", ("host", "server", "hostname")), ("cpu", ("cpu", "cpu_pct", "usage"))):
+            for a in aliases:
+                if a in names:
+                    cols[want] = names.index(a)
+                    break
+        rows = rows[1:]
+    for r in rows:
+        try:
+            raw = r[cols["ts"]].strip()
+            t = parse_time(raw, tz)
+            if t is None:
+                t = clock_to_epoch(raw, ref_day, tz)
+            host = (r[cols["host"]].strip() if len(r) > cols["host"] else "") or label or stem
+            out.append((t, host, float(r[cols["cpu"]])))
+        except (ValueError, IndexError, TypeError):
+            continue
+    return out
+
+
+# ---------------------------------------------------------------- 窓
+
+_REL = re.compile(r"([+-]?\d+(?:\.\d+)?)(ms|s|m|h)?")
+_UNIT = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, None: 1.0}
+
+
+def is_rel(s: str) -> bool:
+    return _REL.fullmatch(s.strip()) is not None
+
+
+def parse_rel(s: str) -> float:
+    m = _REL.fullmatch(s.strip())
+    if not m:
+        raise ValueError(f"相対の時間を読めない: {s!r}（例: -5s, +30s, 1m）")
+    return float(m.group(1)) * _UNIT[m.group(2)]
+
+
+class Window:
+    def __init__(self, start: float, end: float, anchor: float | None):
+        self.start, self.end, self.anchor = start, end, anchor
+
+
+def parse_point(s: str, tz: tzinfo, day) -> float:
+    v = clock_to_epoch(s, day, tz)
+    if v is None:
+        v = parse_time(s, tz)
+    if v is None:
+        raise ValueError(f"時刻を読めない: {s!r}（例: 10:03:20, 2026-10-31T10:03:20+09:00, epoch）")
+    return v
+
+
+def resolve_window(args, tmin: float, tmax: float, tz: tzinfo) -> Window:
+    day = datetime.fromtimestamp(tmin, tz).date()
+    log_end = math.floor(tmax) + 1
+    anchor = parse_point(args.anchor, tz, day) if args.anchor else None
+    if args.last:
+        if args.t_from or args.t_to:
+            raise ValueError("--last と --from/--to は同時に使えない")
+        n = parse_rel(args.last)
+        if n <= 0:
+            raise ValueError("--last は正の長さ（例: 30s）")
+        return Window(log_end - n, log_end, anchor)
+
+    def point(s: str) -> float:
+        if is_rel(s):
+            if anchor is None:
+                raise ValueError(f"{s!r} は相対指定なので --anchor が要る")
+            return anchor + parse_rel(s)
+        return parse_point(s, tz, day)
+
+    if anchor is None and not (args.t_from or args.t_to):
+        raise ValueError("窓の指定が要る: --anchor（と --from/--to）か、--last か、--from/--to の絶対時刻")
+    start = point(args.t_from) if args.t_from else (anchor if anchor is not None else math.floor(tmin))
+    end = point(args.t_to) if args.t_to else log_end
+    if end <= start:
+        fmt = lambda t: datetime.fromtimestamp(t, tz).strftime("%H:%M:%S")  # noqa: E731
+        raise ValueError(f"窓の終わり {fmt(end)} が始まり {fmt(start)} 以前になっている（ログは {fmt(tmin)} 〜 {fmt(tmax)}）")
+    return Window(start, end, anchor)
+
+
+# ---------------------------------------------------------------- 集計
+
+def pct(sorted_vals: list[float], p: float) -> float | None:
+    if not sorted_vals:
+        return None
+    return sorted_vals[max(0, math.ceil(p / 100 * len(sorted_vals)) - 1)]
+
+
+class Agg:
+    __slots__ = ("n", "rts", "s5xx", "s499")
+
+    def __init__(self):
+        self.n = 0
+        self.rts: list[float] = []
+        self.s5xx = 0
+        self.s499 = 0
+
+    def add(self, r: Rec):
+        self.n += 1
+        if r.rt is not None:
+            self.rts.append(r.rt)
+        if 500 <= r.status <= 599:
+            self.s5xx += 1
+        elif r.status == 499:
+            self.s499 += 1
+
+    def sorted_rts(self) -> list[float]:
+        self.rts.sort()
+        return self.rts
+
+    def p(self, q: float) -> float | None:
+        return pct(self.sorted_rts(), q)
+
+    @property
+    def total(self) -> float:
+        return sum(self.rts)
+
+    @property
+    def avg(self) -> float | None:
+        return self.total / len(self.rts) if self.rts else None
+
+
+class Grouper:
+    def __init__(self, patterns: list[tuple[str, re.Pattern]]):
+        self.patterns = patterns
+        self.cache: dict[str, str] = {}
+
+    def key(self, path: str) -> str:
+        k = self.cache.get(path)
+        if k is None:
+            k = path
+            for label, rx in self.patterns:
+                if rx.search(path):
+                    k = label
+                    break
+            if len(self.cache) < 200_000:
+                self.cache[path] = k
+        return k
+
+
+def load_groups(path: str | None) -> Grouper:
+    pats: list[tuple[str, re.Pattern]] = []
+    if path:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()  # alp-groups.txt と同じ。# から行末はコメント
+            if line:
+                pats.append((line, re.compile(line)))
+    return Grouper(pats)
+
+
+# ---------------------------------------------------------------- 出力
+
+def fmt_sec(x: float | None) -> str:
+    if x is None:
+        return "-"
+    ms = x * 1000
+    if ms >= 1000:
+        return f"{x:.2f}s"
+    if ms >= 10:
+        return f"{ms:.0f}ms"
+    return f"{ms:.1f}ms"
+
+
+def esc(s: str) -> str:
+    return s.replace("|", "\\|")
+
+
+def table(headers: list[str], rows: list[list[str]], right_from: int = 1) -> str:
+    aligns = ["---" if i < right_from else "---:" for i in range(len(headers))]
+    out = ["| " + " | ".join(headers) + " |", "| " + " | ".join(aligns) + " |"]
+    for r in rows:
+        out.append("| " + " | ".join(r) + " |")
+    return "\n".join(out)
+
+
+def clock_label(t: float, tz: tzinfo, frac: bool) -> str:
+    dt = datetime.fromtimestamp(t, tz)
+    return dt.strftime("%H:%M:%S.%f")[:-5] if frac else dt.strftime("%H:%M:%S")
+
+
+def agg_cell(a: Agg | None, cpu: float | None) -> str:
+    if a is None or a.n == 0:
+        s = "0"
+    else:
+        s = f"{a.n} {fmt_sec(a.p(50))}/{fmt_sec(a.p(99))}"
+        if a.s5xx:
+            s += f" 5xx:{a.s5xx}"
+        if a.s499:
+            s += f" 499:{a.s499}"
+    if cpu is not None:
+        s += f" cpu:{cpu:.0f}%"
+    return s
+
+
+def build_report(args, recs: list[Rec], stats, cpu_samples, tz: tzinfo, grouper: Grouper) -> str:
+    tmin = min(r.t for r in recs)
+    tmax = max(r.t for r in recs)
+    win = resolve_window(args, tmin, tmax, tz)
+    bucket = args.bucket
+    nb = max(1, math.ceil((win.end - win.start) / bucket))
+    base = win.anchor if win.anchor is not None else win.start
+
+    hosts: list[str] = []
+    for r_label, _, _ in stats:
+        if r_label not in hosts:
+            hosts.append(r_label)
+    for r in recs:
+        if r.host not in hosts:
+            hosts.append(r.host)
+
+    tl: dict[tuple[int, str], Agg] = {}
+    tl_all: dict[int, Agg] = {}
+    ep_in: dict[tuple[str, str], Agg] = {}
+    ep_out: dict[tuple[str, str], Agg] = {}
+    all_in, all_out = Agg(), Agg()
+    for r in recs:
+        ep = (r.method, grouper.key(r.path))
+        if win.start <= r.t < win.end:
+            i = int((r.t - win.start) // bucket)
+            tl.setdefault((i, r.host), Agg()).add(r)
+            tl_all.setdefault(i, Agg()).add(r)
+            ep_in.setdefault(ep, Agg()).add(r)
+            all_in.add(r)
+        else:
+            ep_out.setdefault(ep, Agg()).add(r)
+            all_out.add(r)
+
+    cpu: dict[tuple[int, str], float] = {}
+    cpu_hosts: list[str] = []
+    for t, h, v in cpu_samples:
+        if win.start <= t < win.end:
+            i = int((t - win.start) // bucket)
+            cpu[(i, h)] = max(cpu.get((i, h), 0.0), v)
+            if h not in hosts and h not in cpu_hosts:
+                cpu_hosts.append(h)
+    all_hosts = hosts + cpu_hosts
+
+    out: list[str] = []
+    w = out.append
+    tzname = datetime.fromtimestamp(win.start, tz).strftime("%z")
+    tzname = f"{tzname[:3]}:{tzname[3:]}"
+    frac = bucket != int(bucket)
+    rel_note = f"anchor {clock_label(win.anchor, tz, True)} 基準" if win.anchor is not None else "窓の始まり基準"
+    w("# bench-window")
+    w("")
+    w(f"- 窓: {clock_label(win.start, tz, True)} 〜 {clock_label(win.end, tz, True)}"
+      f"（{win.end - win.start:g} 秒、{rel_note} {int(round(win.start - base)):+d}s〜{int(round(win.end - base)):+d}s、時刻は {tzname}）")
+    w("- 入力: " + "、".join(f"{lab} {ok:,} 行" + (f"（読めない {bad:,} 行）" if bad else "") for lab, ok, bad in stats))
+    w(f"- 窓の中 {all_in.n:,} 件、窓の外 {all_out.n:,} 件（ログの範囲 {clock_label(tmin, tz, True)} 〜 {clock_label(tmax, tz, True)}）")
+    if all_in.n == 0:
+        w("")
+        w("窓の中にリクエストが無い。--anchor・--from・--to・--tz を確かめる。")
+        return "\n".join(out) + "\n"
+
+    # --- タイムライン
+    if args.timeline != "none":
+        w("")
+        w(f"## 秒単位のタイムライン（{bucket:g} 秒ごと）")
+        w("")
+        if args.timeline == "wide":
+            w("セルは「件数 p50/p99」、あれば `5xx:` `499:` `cpu:`（CPU はその秒の最大）。")
+            w("")
+            headers = ["時刻", "相対"] + all_hosts + (["合計"] if len(hosts) > 1 else [])
+            rows = []
+            for i in range(nb):
+                t0 = win.start + i * bucket
+                row = [clock_label(t0, tz, frac), f"{int(round(t0 - base)):+d}s"]
+                for h in all_hosts:
+                    row.append(agg_cell(tl.get((i, h)), cpu.get((i, h))))
+                if len(hosts) > 1:
+                    row.append(agg_cell(tl_all.get(i), None))
+                rows.append(row)
+            w(table(headers, rows, right_from=2))
+        else:
+            headers = ["時刻", "相対", "台", "件数", "p50", "p99", "5xx", "499", "CPU %"]
+            rows = []
+            for i in range(nb):
+                t0 = win.start + i * bucket
+                for h in all_hosts:
+                    a = tl.get((i, h))
+                    c = cpu.get((i, h))
+                    if a is None and c is None:
+                        continue
+                    rows.append([
+                        clock_label(t0, tz, frac), f"{int(round(t0 - base)):+d}s", h,
+                        str(a.n if a else 0), fmt_sec(a.p(50)) if a else "-", fmt_sec(a.p(99)) if a else "-",
+                        str(a.s5xx if a else 0), str(a.s499 if a else 0), f"{c:.0f}" if c is not None else "-",
+                    ])
+            w(table(headers, rows, right_from=3))
+
+        # ピーク
+        busy = sorted(tl_all.items(), key=lambda kv: -kv[1].n)[:3]
+        slow = sorted(((i, a) for i, a in tl_all.items() if a.rts), key=lambda kv: -(kv[1].p(99) or 0))[:3]
+
+        def peak_line(i: int, a: Agg) -> str:
+            t0 = win.start + i * bucket
+            return f"{int(round(t0 - base)):+d}s（{clock_label(t0, tz, frac)}）{a.n} 件 p99 {fmt_sec(a.p(99))}"
+
+        w("")
+        w("ピーク（全台合計）:")
+        w("")
+        w("- 件数が多い秒: " + " / ".join(peak_line(i, a) for i, a in busy))
+        w("- p99 が大きい秒: " + " / ".join(peak_line(i, a) for i, a in slow))
+
+    # --- エンドポイント別
+    win_len = win.end - win.start
+    top = sorted(ep_in.items(), key=lambda kv: -kv[1].total)[: args.top]
+    w("")
+    w(f"## エンドポイント別（窓の中、合計時間の多い順の上位 {len(top)}）")
+    w("")
+    rows = []
+    for (m, label), a in top:
+        rows.append([m, f"`{esc(label)}`", str(a.n), f"{a.total:.2f}", fmt_sec(a.avg), fmt_sec(a.p(99)),
+                     fmt_sec(max(a.rts) if a.rts else None), str(a.s5xx), str(a.s499)])
+    rows.append(["", "**全体**", str(all_in.n), f"{all_in.total:.2f}", fmt_sec(all_in.avg), fmt_sec(all_in.p(99)),
+                 fmt_sec(max(all_in.rts) if all_in.rts else None), str(all_in.s5xx), str(all_in.s499)])
+    w(table(["メソッド", "エンドポイント", "件数", "合計 s", "平均", "p99", "最大", "5xx", "499"], rows, right_from=2))
+
+    # --- 窓の内外の比較
+    log_lo, log_hi = math.floor(tmin), math.floor(tmax) + 1
+    in_dur = max(0.0, min(win.end, log_hi) - max(win.start, log_lo))
+    out_dur = (log_hi - log_lo) - in_dur
+    w("")
+    w("## 窓の中と外の比較（p99）")
+    w("")
+    if all_out.n == 0:
+        w("窓の外にリクエストが無いので比較できない（ログが窓の中だけ）。")
+    else:
+        w(f"倍率 = 窓の中の p99 ÷ 窓の外の p99。どちらも {args.min_count} 件以上のものだけ。"
+          f"{args.ratio_warn:g} 倍以上は太字。req/s は全台合計（窓の外は {out_dur:g} 秒で割る）。")
+        w("")
+        cand = []
+        for ep, a in ep_in.items():
+            b = ep_out.get(ep)
+            if b is None or a.n < args.min_count or b.n < args.min_count:
+                continue
+            pi, po = a.p(99), b.p(99)
+            ratio = (pi / po) if (pi is not None and po) else None
+            cand.append((ep, a, b, pi, po, ratio))
+        cand.sort(key=lambda x: -(x[5] if x[5] is not None else -1))
+
+        def cmp_row(m, label, a, b, pi, po, ratio):
+            rt = "-" if ratio is None else (f"**{ratio:.1f}x**" if ratio >= args.ratio_warn else f"{ratio:.1f}x")
+            rps_i = f"{a.n / win_len:.1f}" if win_len > 0 else "-"
+            rps_o = f"{b.n / out_dur:.1f}" if out_dur >= 1 else "-"
+            return [m, label, rt, fmt_sec(pi), fmt_sec(po), str(a.n), str(b.n), rps_i, rps_o]
+
+        rows = [cmp_row(ep[0], f"`{esc(ep[1])}`", a, b, pi, po, ratio) for ep, a, b, pi, po, ratio in cand[: args.top]]
+        pi, po = all_in.p(99), all_out.p(99)
+        rows.append(cmp_row("", "**全体**", all_in, all_out, pi, po, (pi / po) if (pi is not None and po) else None))
+        w(table(["メソッド", "エンドポイント", "倍率", "p99 中", "p99 外", "件数 中", "件数 外", "req/s 中", "req/s 外"], rows, right_from=2))
+    return "\n".join(out) + "\n"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bench-window",
+        description="ベンチの窓だけを切り出して nginx のアクセスログを集計する（LTSV / JSON、複数台）。",
+        epilog="例: bench-window host1=host1/access.log host2=host2/access.log --anchor 10:03:20 --from -5s --to +30s",
+    )
+    p.add_argument("logs", nargs="+", metavar="LOG", help="アクセスログ。`台の名前=パス` でラベルを付けられる。.gz と - (stdin) も可")
+    p.add_argument("--host-label", action="append", default=[], metavar="NAME", help="LOG と同じ順に台の名前を付ける（繰り返し可）。省略時はファイル名かディレクトリ名")
+    p.add_argument("--host-key", metavar="KEY", help="ログの中のこのキーの値を台の名前にする（ファイルごとのラベルより優先）")
+    p.add_argument("--anchor", metavar="TIME", help="基準の時刻（受付開始など）。10:03:20 / ISO 8601 / epoch")
+    p.add_argument("--from", dest="t_from", metavar="X", help="窓の始まり。-5s のような anchor からの相対か、絶対の時刻。既定は anchor（無ければログの先頭）")
+    p.add_argument("--to", dest="t_to", metavar="X", help="窓の終わり（含まない）。+30s のような相対か、絶対の時刻。既定はログの末尾")
+    p.add_argument("--last", metavar="DUR", help="ログの最後から DUR 秒（例: 30s）を窓にする。--from/--to とは併用不可")
+    p.add_argument("--group", metavar="FILE", help="URI をまとめる正規表現のファイル（1 行 1 つ、# はコメント。alp-groups.txt と同じ形）")
+    p.add_argument("--cpu", action="append", default=[], metavar="FILE", help="CPU の時系列。mpstat・pidstat の出力か、ts,host,cpu の CSV。`台の名前=パス` 可。繰り返し可")
+    p.add_argument("--cpu-cores", type=int, metavar="N", help="pidstat の合計を N コアで割って全コア平均 %% にする（既定はバナーの (N CPU)）")
+    p.add_argument("--tz", default="+09:00", metavar="TZ", help="時刻の表示と、時刻にタイムゾーンが無い入力の解釈（既定 +09:00）")
+    p.add_argument("--bucket", type=int, default=1, metavar="SEC", help="タイムラインの刻み（秒、既定 1）")
+    p.add_argument("--timeline", choices=("wide", "long", "none"), default="wide", help="wide: 1 秒 1 行で台を横に並べる（既定）/ long: 台 × 秒の縦長 / none: 出さない")
+    p.add_argument("--top", type=int, default=20, metavar="N", help="エンドポイント別の表の行数（既定 20）")
+    p.add_argument("--min-count", type=int, default=5, metavar="N", help="比較に使う最小の件数（既定 5。少ないと p99 が不安定）")
+    p.add_argument("--ratio-warn", type=float, default=2.0, metavar="X", help="倍率がこれ以上なら太字（既定 2.0）")
+    return p
+
+
+def bind_time_values(argv: list[str]) -> list[str]:
+    """--from -5s を --from=-5s にする。argparse は -5s をオプションと読んでしまう。"""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--from", "--to") and i + 1 < len(argv):
+            out.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
+    args = p.parse_args(bind_time_values(sys.argv[1:] if argv is None else argv))
+    if args.bucket < 1:
+        p.error("--bucket は 1 以上")
+    try:
+        tz = parse_tz(args.tz)
+        recs, stats = load_logs(args.logs, args.host_label, tz, args.host_key)
+    except (ValueError, OSError) as e:
+        p.error(str(e))
+    if not recs:
+        print("読めるログの行が無い（LTSV か JSON の 1 行 1 リクエストで、時刻と URI のキーが要る）。", file=sys.stderr)
+        return 1
+    try:
+        grouper = load_groups(args.group)
+        day = datetime.fromtimestamp(min(r.t for r in recs), tz).date()
+        cpu_samples: list[tuple[float, str, float]] = []
+        for spec in args.cpu:
+            cpu_samples.extend(load_cpu(spec, tz, day, args.cpu_cores))
+        report = build_report(args, recs, stats, cpu_samples, tz, grouper)
+    except (ValueError, OSError, re.error) as e:
+        p.error(str(e))
+    sys.stdout.write(report)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

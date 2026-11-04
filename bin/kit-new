@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# kit-new <repo-dir> [--env <isu.env>] [--with-checkpoint] [--dry-run]
+#   競技用リポジトリを作る。template と tools を展開する。
+#
+#   当日:   bin/kit-new ~/workspace/github.com/<org>/isucon2027
+#   練習:   bin/kit-new /path/to/practice-repo --env /path/to/isu.env
+#
+# - --with-checkpoint: 区切りの hook（tools/checkpoint）と skill audit も入れる。標準では入れない。
+#
+# - AGENTS.md・docs/README.md はキットのもので上書きする。それ以外の既存ファイルは上書きしない。
+# - git add までする。コミットは人間が見てから。
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+
+[ $# -ge 1 ] || usage
+dst=$1; shift
+env=""; dry=0; checkpoint=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --env) env=${2:?--env needs a file}; shift 2 ;;
+    --with-checkpoint) checkpoint=1; shift ;;
+    --dry-run) dry=1; shift ;;
+    -h|--help) usage ;;
+    *) echo "unknown option: $1" >&2; usage ;;
+  esac
+done
+
+# 上書きするもの（キットが正）
+overwrite="AGENTS.md docs/README.md"
+
+run() { if [ $dry = 1 ]; then echo "+ $*"; else "$@"; fi; }
+
+# 1. リポジトリ
+run mkdir -p "$dst"
+[ -d "$dst/.git" ] || run git -C "$dst" init -q -b main
+
+# 2. template
+(cd "$here/template" && find . -type f ! -name .DS_Store | sed 's|^\./||' | sort) | while read -r f; do
+  if [ -e "$dst/$f" ] && ! printf '%s\n' $overwrite | grep -qx "$f"; then
+    echo "skip（既存）: $f"; continue
+  fi
+  run mkdir -p "$dst/$(dirname "$f")"
+  run cp -p "$here/template/$f" "$dst/$f"
+done
+
+# 3. 道具（tests と fixtures は持ち込まない）
+for t in "$here"/tools/*/; do
+  name=$(basename "$t")
+  [ "$name" = checkpoint ] && [ $checkpoint = 0 ] && continue
+  [ -e "$dst/tools/$name" ] && { echo "skip（既存）: tools/$name"; continue; }
+  run mkdir -p "$dst/tools/$name"
+  (cd "$t" && find . -type f ! -path './tests/*' ! -name .DS_Store | sed 's|^\./||') | while read -r f; do
+    run mkdir -p "$dst/tools/$name/$(dirname "$f")"
+    run cp -p "$t$f" "$dst/tools/$name/$f"
+  done
+done
+
+# 4. フラグの台帳
+if [ ! -e "$dst/docs/flags.md" ] && [ -e "$here/tools/flags/flags.template.md" ]; then
+  run cp "$here/tools/flags/flags.template.md" "$dst/docs/flags.md"
+fi
+
+# 5. isu.env と skill のリンク（Claude Code と Codex で同じ skill を読む: .claude/skills -> ../.agents/skills）
+if [ -n "$env" ]; then run cp "$env" "$dst/isu.env"; fi
+if [ ! -e "$dst/.claude/skills" ]; then
+  run mkdir -p "$dst/.claude"
+  run ln -s ../.agents/skills "$dst/.claude/skills"
+fi
+
+# 6. 区切りの hook と skill audit（--with-checkpoint のときだけ）
+if [ $checkpoint = 1 ]; then
+  run mkdir -p "$dst/.agents/skills/audit"
+  run cp -p "$here/tools/checkpoint/audit/SKILL.md" "$dst/.agents/skills/audit/SKILL.md"
+  hookcmd='"$CLAUDE_PROJECT_DIR"/tools/checkpoint/checkpoint hook'
+  sj="$dst/.claude/settings.json"
+  if [ $dry = 1 ]; then echo "+ hooks.PostToolUse に checkpoint を足す: $sj"
+  elif ! grep -q 'tools/checkpoint/checkpoint' "$sj" 2>/dev/null; then
+    mkdir -p "$dst/.claude"; [ -f "$sj" ] || echo '{}' > "$sj"
+    tmp=$(mktemp)
+    jq --arg c "$hookcmd" '.hooks.PostToolUse = ((.hooks.PostToolUse // []) + [{matcher: "*", hooks: [{type: "command", command: $c}]}])' "$sj" > "$tmp" && mv "$tmp" "$sj"
+  fi
+fi
+
+# 7. タスクボード
+if [ $dry = 0 ]; then
+  if command -v dot >/dev/null && [ ! -d "$dst/.dots" ]; then (cd "$dst" && dot init >/dev/null); fi
+  git -C "$dst" add -A
+fi
+echo "展開しました: $dst"
+echo "次: isu.env を埋める → docs/README.md の作戦ボードから始める（主ループは skill main-loop）"

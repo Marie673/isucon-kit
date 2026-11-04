@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# checkpoint — 決まった区切りに、主ループへ「監査・見直し」を促す（Claude Code の PostToolUse hook）。
+#
+#   tools/checkpoint/checkpoint start [HH:MM]   開始の時刻を記録する（省略すると今。本番は 10:00）
+#   tools/checkpoint/checkpoint status          区切りの一覧と、出したかどうか
+#   tools/checkpoint/checkpoint hook            hook から呼ぶ。期限の来た区切りを 1 回だけ出す
+#
+# 区切りは同じディレクトリの checkpoints.tsv（開始からの分<TAB>ID<TAB>文）。
+# 記録は git のディレクトリの中（コミットされない）。開始が記録されていなければ何もしない。
+# skill の文章に頼らず、時刻が来たら必ず割り込むための仕組み。裁定そのものは情報で出す（skill main-loop）。
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(git -C "$here" rev-parse --show-toplevel 2>/dev/null) || exit 0
+gd=$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+st="$gd/checkpoint"
+tsv="$here/checkpoints.tsv"
+
+cmd=${1:-hook}
+case "$cmd" in
+  start)
+    mkdir -p "$st"
+    if [ -n "${2:-}" ]; then
+      t=$(date -j -f '%Y-%m-%d %H:%M' "$(date +%F) $2" +%s 2>/dev/null || date -d "$(date +%F) $2" +%s)
+    else
+      t=$(date +%s)
+    fi
+    echo "$t" > "$st/start"; : > "$st/fired"
+    echo "開始: $(date -r "$t" '+%F %T' 2>/dev/null || date -d "@$t" '+%F %T')"
+    ;;
+  status)
+    [ -f "$st/start" ] || { echo "開始が未記録（checkpoint start）"; exit 0; }
+    s=$(cat "$st/start"); now=$(date +%s)
+    while IFS=$'\t' read -r off id msg; do
+      case "$off" in ''|\#*) continue ;; esac
+      due=$((s + off * 60))
+      mark=" "; grep -qx "$id" "$st/fired" 2>/dev/null && mark="✓"
+      printf '%s T+%d:%02d %-10s %s\n' "$mark" $((off / 60)) $((off % 60)) "$id" "$( [ "$now" -ge "$due" ] && echo 期限済み || echo 未来)"
+    done < "$tsv"
+    ;;
+  hook)
+    cat > /dev/null  # hook の入力（JSON）は使わない
+    [ -f "$st/start" ] && [ -f "$tsv" ] || exit 0
+    s=$(cat "$st/start"); now=$(date +%s); out=""
+    while IFS=$'\t' read -r off id msg; do
+      case "$off" in ''|\#*) continue ;; esac
+      [ "$now" -ge $((s + off * 60)) ] || continue
+      grep -qx "$id" "$st/fired" 2>/dev/null && continue
+      echo "$id" >> "$st/fired"
+      out+="[checkpoint $id T+$((off / 60)):$(printf %02d $((off % 60)))] $msg"$'\n'
+    done < "$tsv"
+    # 情報の合図: 作戦ボード（docs/README.md の判断の数字）を最後に直してから、ベンチが 3 本以上流れた
+    sm="$root/docs/README.md"
+    if [ -f "$sm" ] && [ -d "$root/results" ]; then
+      smt=$(git -C "$root" log -1 --format=%ct -- docs/README.md 2>/dev/null); smt=${smt:-0}
+      n=$(find "$root/results" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-*' -newermt "@$smt" 2>/dev/null | wc -l | tr -d ' ')
+      if [ "${n:-0}" -ge 3 ] && ! grep -qx "stale-$smt" "$st/fired" 2>/dev/null; then
+        echo "stale-$smt" >> "$st/fired"
+        out+="[checkpoint stale] 作戦ボードの判断の数字を最後に直してから、ベンチが ${n} 本流れた。表（点・点の式の項・取りこぼし・今の律速・撤回の条件）を直してから次の手を選ぶ。撤回の条件を満たしていたら裁定を出し直す。効く項を止めているものを律速に選ぶ（skill audit の 3・7c）。"$'\n'
+      fi
+    fi
+    [ -n "$out" ] || exit 0
+    if command -v jq >/dev/null; then
+      jq -n --arg c "$out" '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $c}}'
+    else
+      printf '%s' "$out" >&2; exit 2
+    fi
+    ;;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1 ;;
+esac

@@ -1,0 +1,24 @@
+# hosts/<host>/etc/systemd/system/ に置き、元のアプリのサービスは disable する。
+# 再起動試験: 起動順序に依存しない（DB を使わない）/ Restart=always / SIGTERM で delta を flush
+[Unit]
+Description=isu in-memory app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=isucon
+Group=isucon
+WorkingDirectory=/home/isucon/webapp/rust-mem
+EnvironmentFile=-/home/isucon/env.sh
+Environment=ISU_LISTEN=0.0.0.0:8080
+Environment=ISU_SEED_DIR=/home/isucon/webapp/rust-mem/seed
+Environment=ISU_DELTA=/home/isucon/state/delta.jsonl
+ExecStart=/home/isucon/webapp/rust-mem/isu-mem
+Restart=always
+RestartSec=1
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=1006500
+
+[Install]
+WantedBy=multi-user.target

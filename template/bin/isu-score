@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# isu-score <id> <score> [note]  — ポータルで見たスコアを記録（SUMMARY と SCOREBOARD を更新してコミット）
+# isu-score                      — スコアボードを表示
+# isu-score --regen              — SCOREBOARD.md を作り直すだけ
+. "$(dirname "$0")/lib.sh"
+SB="$ISU_RESULTS/SCOREBOARD.md"
+
+regen() {
+  local prev="" d
+  {
+    echo "# SCOREBOARD"
+    echo
+    echo "bin/isu-bench が自動生成。外れた施策もここに残る。Δ は直前の記録との差。"
+    echo
+    echo "| id | score | Δ | commit | branch | who | note |"
+    echo "|---|---|---|---|---|---|---|"
+    for m in $(ls -1 "$ISU_RESULTS"/*/meta.env 2>/dev/null | sort); do
+      ( ID="" SCORE="" SHA="" BRANCH="" WHO="" NOTE=""
+        # shellcheck disable=SC1090
+        . "$m"; echo "$ID|${SCORE:-}|$SHA|$BRANCH|$WHO|$NOTE" )
+    done | while IFS='|' read -r i s c b w n; do
+      d=""; if [ -n "$s" ] && [ -n "$prev" ]; then d=$(( s - prev )); [ $d -ge 0 ] && d="+$d"; fi
+      [ -n "$s" ] && prev=$s
+      echo "| [$i]($i/SUMMARY.md) | ${s:-?} | $d | $c | $b | $w | $n |"
+    done
+  } > "$SB"
+}
+
+case "${1:-}" in
+  "") [ -f "$SB" ] || regen; cat "$SB" ;;
+  --regen) mkdir -p "$ISU_RESULTS"; regen ;;
+  *)
+    id=$1; score=${2:?usage: isu-score <id> <score> [note]}; note=${3:-}
+    m="$ISU_RESULTS/$id/meta.env"; [ -f "$m" ] || die "no such result: $id"
+    grep -v '^SCORE=' "$m" > "$m.tmp"; echo "SCORE=$score" >> "$m.tmp"
+    [ -n "$note" ] && { grep -v '^NOTE=' "$m.tmp" > "$m.tmp2"; echo "NOTE=$(printf %q "$note")" >> "$m.tmp2"; mv "$m.tmp2" "$m.tmp"; }
+    mv "$m.tmp" "$m"
+    "$ISU_ROOT/bin/isu-summarize" "$id"
+    regen
+    isu_commit_shared "score $id: $score" "results/$id" results/SCOREBOARD.md
+    tail -n 5 "$SB" ;;
+esac

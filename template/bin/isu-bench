@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# isu-bench [--no-deploy] [--note TEXT] [--wait-lock SECS] [--allow-dirty] [--skip-golden]
+#   ベンチ1回 = チームの同期点。ロック -> deploy -> 計測開始 -> ベンチ -> 回収・要約 -> 解放 -> 結果をコミット
+#   ISU_BENCH_CMD が空なら（本番）ポータルでの実行を待ち、アクセスログの流量で開始・終了を検知する。
+#   結果: results/<id>/SUMMARY.md（メインチェックアウトにコミットされる）
+#   本番のスコアはポータルで見て bin/isu-score <id> <score> で記録する。
+. "$(dirname "$0")/lib.sh"
+deploy=1; note=""; waitlock=0; dirty=""; golden=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-deploy) deploy=0 ;;
+    --note) note="$2"; shift ;;
+    --wait-lock) waitlock="$2"; shift ;;
+    --allow-dirty) dirty=--allow-dirty ;;
+    --skip-golden) golden=0 ;;
+    *) die "unknown option: $1" ;;
+  esac; shift
+done
+
+sha=$(git -C "$ISU_ROOT" rev-parse --short HEAD)
+id="$(date +%m%d-%H%M%S)-$sha"
+"$ISU_ROOT/bin/isu-lock" acquire "bench $id" --wait "$waitlock"
+trap 'isu_lock_release >/dev/null 2>&1; isu_wait_clear' EXIT
+
+if [ $deploy = 1 ]; then
+  # shellcheck disable=SC2086
+  "$ISU_ROOT/bin/isu-deploy" $dirty
+  sleep 2   # 再起動直後のウォームアップ
+  # レスポンス互換を壊していたら公式ベンチに出さない
+  if [ $golden = 1 ] && ls "$ISU_ROOT"/golden/*.txt >/dev/null 2>&1; then
+    "$ISU_ROOT/bin/isu-golden" check || die "golden に差分があるのでベンチを中止しました（意図した変更なら --skip-golden）"
+  fi
+fi
+
+R="$ISU_RESULTS/$id"; mkdir -p "$R"
+{ echo "ID=$id"; echo "SHA=$sha"; echo "BRANCH=$(git -C "$ISU_ROOT" branch --show-current)"
+  echo "WHO=$ISU_WHO"; echo "NOTE=$(printf %q "$note")"; echo "DEPLOYED=$deploy"; } > "$R/meta.env"
+
+"$ISU_ROOT/bin/isu-measure" start "$id"
+if [ -n "$ISU_BENCH_CMD" ]; then
+  read -r s shms < <(isu_ssh "$ISU_BENCH_HOST" 'date "+%s %T"')
+  { echo "START=$s"; echo "START_HMS=$shms"; } >> "$R/meta.env"
+  if [ -n "$ISU_PPROF_URL" ]; then for h in $ISU_APP_HOSTS; do
+    isu_ssh "$h" "nohup curl -s -o /tmp/isu-m/cpu.pprof '$ISU_PPROF_URL?seconds=${ISU_PPROF_SECONDS:-60}' >/dev/null 2>&1 < /dev/null &"
+  done; fi
+  log "bench: $ISU_BENCH_CMD"
+  isu_wait_mark "ベンチ実行中 #$id"
+  isu_ssh "$ISU_BENCH_HOST" "$ISU_BENCH_CMD" > "$R/bench.log" 2>&1 || warn "ベンチがエラー終了しました（bench.log を確認）"
+  read -r e ehms < <(isu_ssh "$ISU_BENCH_HOST" 'date "+%s %T"')
+  { echo "END=$e"; echo "END_HMS=$ehms"; } >> "$R/meta.env"
+  if [ -n "$ISU_SCORE_REGEX" ]; then
+    score=$(perl -ne "print \"\$1\n\" if /$ISU_SCORE_REGEX/" "$R/bench.log" | tail -1)
+    [ -n "$score" ] && echo "SCORE=$score" >> "$R/meta.env"
+  fi
+else
+  "$ISU_ROOT/bin/isu-measure" wait "$id"
+fi
+"$ISU_ROOT/bin/isu-measure" stop "$id"
+isu_lock_release >/dev/null 2>&1 || true
+
+"$ISU_ROOT/bin/isu-score" --regen
+isu_commit_shared "bench $id${note:+: $note}" "results/$id" results/SCOREBOARD.md
+
+# この branch に PR があれば結果を残す（外れた施策も含めて記録する）
+if [ "${ISU_PR_COMMENT:-1}" = 1 ] && command -v gh >/dev/null; then
+  if gh pr view --json number >/dev/null 2>&1; then
+    { echo "### bench \`$id\`"; echo; head -n 40 "$R/SUMMARY.md"; } | gh pr comment --body-file - >/dev/null 2>&1 \
+      && log "PR に結果をコメントしました"
+  fi
+fi
+
+echo
+sed -n '1,45p' "$R/SUMMARY.md"
+echo
+ok "results/$id/SUMMARY.md"
+grep -q '^SCORE=' "$R/meta.env" || warn "スコア未記録: ポータルの値を bin/isu-score $id <score> で記録してください"

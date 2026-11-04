@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# isu-import — サーバのコードと設定を repo に取り込む（「壊しても戻せる床」を作る）
+#   共通コード : 先頭のアプリホストの /home/isucon/{ISU_IMPORT_PATHS} -> repo 直下（webapp/ など）
+#   ホスト設定 : 各ホストの /etc/nginx /etc/mysql、サービスの unit、env.sh -> hosts/<host>/ 以下に同じパスで
+# 秘密鍵（tls/*.key など）は取り込まない。取り込み後は git diff を見てからコミットする。
+. "$(dirname "$0")/lib.sh"
+
+app=$(set -- $ISU_APP_HOSTS; echo "$1")
+excl=""; for e in $ISU_IMPORT_EXCLUDE; do excl="$excl --exclude=$e"; done
+
+log "$app: /home/isucon/{$ISU_IMPORT_PATHS} -> repo"
+# shellcheck disable=SC2086
+isu_ssh "$app" "cd /home/isucon && tar -czf - $excl $(for p in $ISU_IMPORT_PATHS; do [ "$p" = env.sh ] || printf '%s ' "$p"; done)" \
+  | tar -xzf - -C "$ISU_ROOT"
+
+for h in $ISU_HOSTS; do
+  [ -n "$(isu_ip "$h")" ] || continue
+  log "$h: 設定 -> hosts/$h/"
+  mkdir -p "$ISU_ROOT/hosts/$h"
+  # shellcheck disable=SC2046
+  isu_sh "$h" $(isu_services "$h") <<'EOS' | tar -xzf - -C "$ISU_ROOT/hosts/$h"
+set -eu
+paths=""
+for p in etc/nginx etc/mysql home/isucon/env.sh; do [ -e "/$p" ] && paths="$paths $p"; done
+for s in "$@"; do
+  f=$(systemctl show -p FragmentPath --value "$s" 2>/dev/null || true)
+  case "$f" in /etc/systemd/system/*) paths="$paths ${f#/}";; esac
+done
+sudo tar -C / -czf - --exclude='*.key' --exclude='*.pem' --exclude='etc/nginx/tls' \
+  --exclude='etc/mysql/debian.cnf' --exclude='*-enabled/*.dpkg-*' $paths
+EOS
+done
+
+# 取り込んだ結果のサマリ
+git -C "$ISU_ROOT" status --short | head -40
+ok "import 完了。git diff を確認してコミットしてください"

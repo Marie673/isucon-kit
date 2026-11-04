@@ -1,0 +1,7 @@
+# isu-golden のリクエスト一覧: NAME METHOD PATH [curl の追加引数...]
+# 上から順に実行し、cookie は引き継ぐ（ログイン → 認証付き API の順に並べる）。
+# kickoff でマニュアルとアクセスログから「ベンチが叩く主要 API」を書き起こす。
+# 例:
+# login        POST /api/login      -H 'Content-Type: application/json' -d '{"name":"user1","password":"pass"}'
+# me           GET  /api/me
+# list         GET  /api/items?limit=20

@@ -1,0 +1,82 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""stop-rule: 最終ベンチを「いつ止めるか」を期待値で決める。
+
+最終スコアが「最後に流した 1 本の点」の回は、点のぶれが大きいと、何本流して
+どこで止めるかで最終の点が変わる。同じ版で測った点の一覧を、その版の点の分布と
+みなし、残りに流せる本数から「この点以上なら止める」閾値を出す。
+
+  V_0 = 流せない（今の点で止まるしかない）
+  V_1 = E[X]                    （あと 1 本なら、流した点をそのまま受け取る）
+  V_k = E[max(X, V_{k-1})]      （あと k 本なら、流して V_{k-1} 以上なら止める）
+
+直前の 1 本の点が V_k（残り k 本）以上なら止める。下回ればもう 1 本流す。
+fail は 0 点として一覧に入れる（落ちる率も分布に含める）。
+
+  stop-rule --scores 584535,549096,548654,556170 --remaining 3
+  stop-rule --scores-file results/final-scores.txt --remaining 2 --last 556170
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+
+
+def thresholds(scores: list[float], k_max: int) -> list[float]:
+    """thresholds[k] = 残り k 本のときの期待値 V_k（k >= 1）。thresholds[0] は未使用。"""
+    n = len(scores)
+    v = [float("nan")]
+    prev = None
+    for k in range(1, k_max + 1):
+        if prev is None:
+            cur = sum(scores) / n
+        else:
+            cur = sum(max(x, prev) for x in scores) / n
+        v.append(cur)
+        prev = cur
+    return v
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scores", help="同じ版で測った点（カンマ区切り。fail は 0）")
+    ap.add_argument("--scores-file", help="1 行 1 つの点のファイル")
+    ap.add_argument("--remaining", type=int, required=True, help="この後に流せる本数（締め切りまでの残り時間 ÷ 1 本の所要）")
+    ap.add_argument("--last", type=float, help="直前に流した 1 本の点（止めるかの判定をする）")
+    a = ap.parse_args()
+
+    vals: list[float] = []
+    if a.scores:
+        vals += [float(x) for x in a.scores.replace(" ", "").split(",") if x]
+    if a.scores_file:
+        with open(a.scores_file) as f:
+            vals += [float(x) for x in f.read().split() if x.strip()]
+    if len(vals) < 3:
+        print("点が 3 本未満。分布とみなすには少ない（3 本以上を同じ版で測る）", file=sys.stderr)
+        return 2
+    if a.remaining < 0:
+        print("--remaining は 0 以上", file=sys.stderr)
+        return 2
+
+    v = thresholds(vals, max(a.remaining, 1))
+    print(f"版の点: {len(vals)} 本、平均 {sum(vals)/len(vals):,.0f}、最小 {min(vals):,.0f}、最大 {max(vals):,.0f}")
+    for k in range(1, a.remaining + 1):
+        print(f"  残り {k} 本のときの閾値（流し続けた場合の期待値）: {v[k]:,.0f}")
+    if a.last is not None:
+        if a.remaining == 0:
+            print(f"判定: 止める（もう流せない。最終は {a.last:,.0f}）")
+            return 0
+        th = v[a.remaining]
+        if a.last >= th:
+            print(f"判定: 止める（直前 {a.last:,.0f} ≥ 閾値 {th:,.0f}）")
+            return 0
+        print(f"判定: もう 1 本流す（直前 {a.last:,.0f} < 閾値 {th:,.0f}）")
+        return 10
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# isu-review plan [file|-] | diff [base]  [--with codex|claude] — 別モデルレビュー（smart-friend）
+#   Claude から呼べば Codex が、Codex から呼べば Claude がレビューする（--with で明示も可）。
+#   使う場面は「間違えると失格になる不可逆な変更」に絞る: 永続化・追試まわり・全書き換えの設計・整合性。
+#   plan: 実装前の設計を渡す（ファイルか標準入力）   diff: base（既定 main）からの差分をレビュー
+. "$(dirname "$0")/lib.sh"
+mode=${1:?usage: isu-review plan [file|-] | diff [base] [--with codex|claude]}; shift
+arg=""; with=""
+while [ $# -gt 0 ]; do
+  case "$1" in --with) with="$2"; shift ;; *) arg="$1" ;; esac; shift
+done
+if [ -z "$with" ]; then
+  if env | grep -q '^CODEX_'; then with=claude; else with=codex; fi
+fi
+
+read -r -d '' RUBRIC <<'EOF' || true
+あなたは ISUCON に参加中のチームの「別モデルレビュアー」です。レビュー対象を読み、次の観点だけで指摘してください。
+1. 外部仕様・レスポンス互換を壊していないか（URI、レスポンス構造、ステータス、整合性チェックで落ちる挙動）
+2. 再起動試験で失格にならないか（再起動後にアプリが自動で起動するか、ベンチが書いたデータが残るか、起動順序に依存していないか）
+3. 並行性・競合・データ整合性（ロック、トランザクション、キャッシュの無効化漏れ）
+4. 性能上の落とし穴（N+1 の残り、ロック競合、無駄なシリアライズ、メモリ爆発）
+5. 根拠のない思い込み（仕様の出典が docs/RULES.md やマニュアルにない前提）
+競技なので、保守性・可読性・一般的なベストプラクティス・テスト不足は指摘しないこと。
+リポジトリのファイル（AGENTS.md, docs/RULES.md など）は必要に応じて読んでよいが、変更はしないこと。
+出力形式: 重大度（BLOCKER / MAJOR / MINOR）付きの箇条書き。各1〜2行、根拠の file:line を添える。
+問題がなければ「LGTM」の1行だけを返す。
+EOF
+
+case "$mode" in
+  plan)
+    if [ -z "$arg" ] || [ "$arg" = - ]; then body=$(cat); else body=$(cat "$arg"); fi
+    prompt="$RUBRIC
+
+以下は実装前の設計案です。設計の段階で潰すべき問題を指摘してください。"
+    log "plan review by $with"
+    case "$with" in
+      codex) printf '%s\n' "$body" | codex exec -s read-only -c model_reasoning_effort=high "$prompt" 2> "$ISU_STATE/review.log" ;;
+      claude) printf '%s\n\n<plan>\n%s\n</plan>\n' "$prompt" "$body" | claude -p --allowedTools Read Grep Glob ;;
+    esac ;;
+  diff)
+    base=${arg:-main}
+    git -C "$ISU_ROOT" diff --quiet "$base"...HEAD && die "$base との差分がありません"
+    log "diff review ($base...HEAD) by $with"
+    case "$with" in
+      codex) (cd "$ISU_ROOT" && codex exec review --base "$base" -c model_reasoning_effort=high "$RUBRIC" 2> "$ISU_STATE/review.log") ;;
+      claude) { printf '%s\n\n<diff base="%s">\n' "$RUBRIC" "$base"; git -C "$ISU_ROOT" diff "$base"...HEAD; echo '</diff>'; } \
+                | (cd "$ISU_ROOT" && claude -p --allowedTools Read Grep Glob) ;;
+    esac ;;
+  *) die "usage: isu-review plan [file|-] | diff [base]" ;;
+esac

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# isu-golden record|check [--no-init] — 公式ベンチに出す前のレスポンス互換チェック
+#   conf/golden.txt の各行（NAME METHOD PATH [curl の追加引数...]）を nginx ホスト上から順に叩き、
+#   ステータスと本文（JSON は jq -S で正規化）を golden/<NAME>.txt と比べる。
+#   同じ実行の中では cookie を引き継ぐので、ログイン → 認証付き API の順に並べられる。
+#   record: 初期実装の状態で一度だけ取る（initialize 直後に叩くので毎回同じ結果になる前提）
+#   check : 今のデプロイで取り直して diff。差分があれば exit 1
+#   値が毎回変わるフィールドは ISU_GOLDEN_JQ（jq フィルタ）で消す。例:
+#     ISU_GOLDEN_JQ='walk(if type=="object" then del(.created_at, .id) else . end)'
+. "$(dirname "$0")/lib.sh"
+mode=${1:?usage: isu-golden record|check [--no-init]}; init=1; [ "${2:-}" = --no-init ] && init=0
+list="$ISU_ROOT/conf/golden.txt"; [ -f "$list" ] || die "conf/golden.txt がありません"
+now="$ISU_STATE/golden-now"; rm -rf "$now"; mkdir -p "$now"
+reqs=$({ grep -vE '^[[:space:]]*(#|$)' "$list" || true; } | base64 | tr -d '\n')
+
+isu_sh "$ISU_NGINX_HOST" "$ISU_TARGET_HOST" "$init" "$ISU_INIT_PATH" "${ISU_GOLDEN_JQ:-.}" "$reqs" "${ISU_INIT_ARGS:-}" <<'EOS' | tar -xzf - -C "$now"
+HOST=$1 INIT=$2 INIT_PATH=$3 JQ=$4 REQS=$5 INIT_ARGS=$6
+D=$(mktemp -d); JAR=$D/.jar
+c() { curl -sk --max-time 30 --resolve "$HOST:443:127.0.0.1" -b "$JAR" -c "$JAR" "$@"; }
+if [ "$INIT" = 1 ]; then
+  eval "iargs=($INIT_ARGS)"
+  code=$(c -X POST -o "$D/init" -w '%{http_code}' "${iargs[@]}" "https://$HOST$INIT_PATH")
+  case "$code" in 2*) ;; *) { echo "HTTP $code"; cat "$D/init"; } > "$D/_INITIALIZE_FAILED.txt" ;; esac
+  rm -f "$D/init"
+fi
+echo "$REQS" | base64 -d | while read -r name method path rest; do
+  eval "extra=($rest)"
+  code=$(c -X "$method" -o "$D/body" -w '%{http_code}' "${extra[@]}" "https://$HOST$path")
+  { echo "HTTP $code"; jq -S "$JQ" "$D/body" 2>/dev/null || cat "$D/body"; } > "$D/$name.txt"
+done
+rm -f "$D/body" "$JAR"; tar -C "$D" -czf - .
+EOS
+
+if [ -f "$now/_INITIALIZE_FAILED.txt" ]; then
+  cat "$now/_INITIALIZE_FAILED.txt" >&2
+  die "initialize に失敗しました（ISU_INIT_PATH / ISU_INIT_ARGS を確認）"
+fi
+case "$mode" in
+  record)
+    rm -rf "$ISU_ROOT/golden"; mkdir -p "$ISU_ROOT/golden"; cp "$now"/*.txt "$ISU_ROOT/golden/"
+    ok "golden/ に $(ls "$ISU_ROOT/golden" | wc -l | tr -d ' ') 件記録しました（コミットしてください）" ;;
+  check)
+    if diff -ru "$ISU_ROOT/golden" "$now" > "$ISU_STATE/golden.diff"; then ok "golden: 差分なし"
+    else cat "$ISU_STATE/golden.diff" | head -80; die "golden: 差分あり（全文: $ISU_STATE/golden.diff）"; fi ;;
+  *) die "usage: isu-golden record|check" ;;
+esac

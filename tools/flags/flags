@@ -1,0 +1,575 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""flags: 環境変数のフラグの台帳（flags.md）と、コード・設定ファイルを突き合わせる。
+
+フラグが 71 個まで増え、どれが有効で何のためか誰も追えなくなった。
+台帳に「何のために入れたか・いつ消すか」を書かせ、台帳とコードと設定ファイルのずれを lint で出す。
+読み取りだけ（`flags new` だけが台帳に 1 行足す）。
+`flags durability` は、永続化を弱める DB の設定を探し、決まりの記録に無ければ止める。サーバーには接続しない。
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import sys
+from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
+
+DEFAULT_PATTERN = r"[A-Z][A-Z0-9_]{3,}"
+DEFAULT_IGNORE = (
+    r"PATH|HOME|USER|LOGNAME|PWD|OLDPWD|SHELL|LANG|LANGUAGE|LC_[A-Z]+|TERM|TZ|TMPDIR|HOSTNAME|"
+    r"RUST_LOG|RUST_BACKTRACE|CARGO_[A-Z_]+|NODE_ENV|NODE_OPTIONS|PYTHONPATH|PYTHONUNBUFFERED|"
+    r"GOMAXPROCS|GOGC|GOMEMLIMIT|XDG_[A-Z_]+|DEBIAN_FRONTEND|INVOCATION_ID|JOURNAL_STREAM|NOTIFY_SOCKET"
+)
+SKIP_DIRS = {".git", "node_modules", "target", "vendor", "__pycache__", ".venv", "venv", "dist", "build", ".cache", ".next"}
+SKIP_SUFFIXES = {".md", ".lock", ".sum", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".gz", ".zip", ".so", ".o", ".a"}
+MAX_BYTES = 2_000_000
+
+TRIAL = {"試験中", "検証中", "trial", "testing"}
+REMOVED = {"削除済", "削除済み", "廃止", "removed", "deleted"}
+EMPTY_WORDS = {"", "-", "—", "–", "?", "tbd", "todo", "なし", "未定", "n/a"}
+UNSET_WORDS = {"", "-", "—", "–", "未設定", "(未設定)", "（未設定）", "unset", "(unset)", "(なし)", "なし"}
+
+# 台帳の列（キー, 見出しの別名）。見出しは日本語でも英語でもよい。
+COLUMNS = [
+    ("name", ("名前", "name", "flag")),
+    ("default", ("既定値", "default")),
+    ("prod", ("本番の値", "prod", "production")),
+    ("purpose", ("目的", "purpose")),
+    ("evidence", ("根拠", "evidence")),
+    ("added", ("入れた時刻", "added")),
+    ("remove_when", ("消す条件", "remove_when", "remove")),
+    ("status", ("状態", "status")),
+]
+HEADER_JA = ["名前", "既定値", "本番の値", "目的", "根拠（PR / 計測）", "入れた時刻", "消す条件", "状態"]
+
+BUILTIN_TEMPLATE = """# フラグ台帳
+
+| 名前 | 既定値 | 本番の値 | 目的 | 根拠（PR / 計測） | 入れた時刻 | 消す条件 | 状態 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+"""
+
+# コード中の環境変数の参照。@@NAME@@ が --pattern（名前の形）に置き換わる。
+ACCESSORS = [
+    r"""env::var(?:_os)?\(\s*["'](?P<n>@@NAME@@)["']""",  # Rust
+    r"""\b(?:option_)?env!\(\s*"(?P<n>@@NAME@@)\"""",  # Rust（コンパイル時）
+    r"""\benv\s*=\s*"(?P<n>@@NAME@@)\"""",  # Rust clap
+    r"""os\.(?:Getenv|LookupEnv)\(\s*"(?P<n>@@NAME@@)\"""",  # Go
+    r"""process\.env\.(?P<n>@@NAME@@)\b""",  # Node
+    r"""process\.env\[\s*["'`](?P<n>@@NAME@@)["'`]\s*\]""",
+    r"""Deno\.env\.get\(\s*["'](?P<n>@@NAME@@)["']""",
+    r"""os\.environ(?:\.get|\.setdefault|\.pop)?\s*[\[(]\s*["'](?P<n>@@NAME@@)["']""",  # Python
+    r"""\bgetenv\(\s*["'](?P<n>@@NAME@@)["']""",  # os.getenv / getenv（C・PHP）
+    r"""\bENV(?:\.fetch\(|\[)\s*["'](?P<n>@@NAME@@)["']""",  # Ruby
+    r"""\$_(?:ENV|SERVER)\[\s*["'](?P<n>@@NAME@@)["']""",  # PHP
+    r"""System\.getenv\(\s*"(?P<n>@@NAME@@)\"""",  # Java
+    r"""\$\{(?P<n>@@NAME@@):?[-=?+]""",  # シェルの ${NAME:-既定値}
+]
+
+
+# ---------------------------------------------------------------- 台帳
+
+def split_md_row(line: str) -> list[str]:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+
+def clean_cell(s: str) -> str:
+    return s.strip().strip("`").strip()
+
+
+def norm_value(v: str) -> str:
+    """値の比較用。引用符・バッククォートを外し、「未設定」の言い方を空にそろえる。"""
+    v = v.strip().strip("`").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return "" if v.lower() in UNSET_WORDS else v
+
+
+class Entry(dict):
+    """台帳の 1 行。キーは COLUMNS の key と line（ファイルの行番号、1 始まり）。"""
+
+
+class Ledger:
+    def __init__(self, entries: list[Entry], lines: list[str], span: tuple[int, int] | None):
+        self.entries, self.lines, self.span = entries, lines, span  # span: 表の [先頭行, 末尾行]（0 始まり、両端を含む）
+
+
+def parse_ledger(text: str) -> Ledger:
+    lines = text.splitlines()
+    entries: list[Entry] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.lstrip().startswith("|"):
+            cells = split_md_row(ln)
+            idx: dict[str, int] = {}
+            for key, aliases in COLUMNS:
+                for j, c in enumerate(cells):
+                    if c.strip().lower().split("（")[0].split("(")[0].strip() in aliases:
+                        idx[key] = j
+                        break
+            if "name" in idx and len(idx) >= 3:
+                end = i
+                j = i + 1
+                while j < len(lines) and lines[j].lstrip().startswith("|"):
+                    end = j
+                    row = split_md_row(lines[j])
+                    if not all(re.fullmatch(r":?-{3,}:?", c.strip()) or c.strip() == "" for c in row):
+                        e = Entry({k: clean_cell(row[ix]) if ix < len(row) else "" for k, ix in idx.items()})
+                        for key, _ in COLUMNS:
+                            e.setdefault(key, "")
+                        e["line"] = j + 1
+                        if e["name"]:
+                            entries.append(e)
+                    j += 1
+                return Ledger(entries, lines, (i, end))
+            while i + 1 < len(lines) and lines[i + 1].lstrip().startswith("|"):  # 台帳でない表は、行ごと読み飛ばす
+                i += 1
+        i += 1
+    return Ledger(entries, lines, None)
+
+
+def parse_added(s: str, now: datetime) -> datetime | None:
+    s = s.strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", s):
+        parts = [int(x) for x in s.split(":")]
+        dt = datetime.combine(now.date(), dtime(*parts), tzinfo=now.tzinfo)
+        return dt - timedelta(days=1) if dt > now + timedelta(minutes=1) else dt
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=now.tzinfo) if dt.tzinfo is None else dt
+
+
+# ---------------------------------------------------------------- 走査
+
+def is_text(path: Path) -> bool:
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            return False
+        with open(path, "rb") as f:
+            return b"\0" not in f.read(4096)
+    except OSError:
+        return False
+
+
+def walk(roots: list[str], extra_skip: set[str], skip_suffixes: set[str]):
+    skip = SKIP_DIRS | extra_skip
+    for root in roots:
+        p = Path(root)
+        if p.is_file():
+            yield p
+            continue
+        for dirpath, dirnames, filenames in os.walk(p):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip)
+            for fn in sorted(filenames):
+                fp = Path(dirpath) / fn
+                if fp.suffix.lower() in skip_suffixes or not is_text(fp):
+                    continue
+                yield fp
+
+
+def scan_code(roots: list[str], pattern: str, extra_skip: set[str], skip_files: set[Path]):
+    rxs = [re.compile(a.replace("@@NAME@@", pattern)) for a in ACCESSORS]
+    refs: dict[str, list[tuple[str, int]]] = {}
+    for fp in walk(roots, extra_skip, SKIP_SUFFIXES):
+        if fp.resolve() in skip_files:
+            continue
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for n, ln in enumerate(lines, 1):
+            for rx in rxs:
+                for m in rx.finditer(ln):
+                    refs.setdefault(m.group("n"), []).append((str(fp), n))
+    return refs
+
+
+def parse_env_value(raw: str) -> str:
+    raw = raw.strip()
+    if raw[:1] in "\"'":
+        q = raw[0]
+        end = raw.find(q, 1)
+        return raw[1:end] if end > 0 else raw[1:]
+    return re.split(r"\s+#", raw, maxsplit=1)[0].strip()
+
+
+def scan_env(roots: list[str], pattern: str, extra_skip: set[str]):
+    name_rx = re.compile(pattern)
+    assign = re.compile(r"^(?:export\s+)?(?P<n>" + pattern + r")=(?P<v>.*)$")
+    refs: dict[str, list[tuple[str, int, str]]] = {}
+    for fp in walk(roots, extra_skip, SKIP_SUFFIXES):
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for n, raw in enumerate(lines, 1):
+            ln = raw.strip()
+            if not ln or ln[0] in "#;[":
+                continue
+            m = re.match(r"Environment\s*=\s*(.*)$", ln)
+            if m:
+                try:
+                    toks = shlex.split(m.group(1))
+                except ValueError:
+                    toks = m.group(1).split()
+                for tok in toks:
+                    k, eq, v = tok.partition("=")
+                    if eq and name_rx.fullmatch(k):
+                        refs.setdefault(k, []).append((str(fp), n, v))
+                continue
+            m = assign.match(ln)
+            if m:
+                refs.setdefault(m.group("n"), []).append((str(fp), n, parse_env_value(m.group("v"))))
+    return refs
+
+
+# ---------------------------------------------------------------- lint
+
+def where(refs, limit: int = 3) -> str:
+    shown = [f"{Path(r[0]).as_posix()}:{r[1]}" for r in refs[:limit]]
+    more = f" 他 {len(refs) - limit} 件" if len(refs) > limit else ""
+    return ", ".join(shown) + more
+
+
+class Scan:
+    def __init__(self, ledger: Ledger, code, env, args, now: datetime):
+        self.ledger, self.code, self.env, self.args, self.now = ledger, code, env, args, now
+        self.ignore_full = [] if args.no_default_ignore else [re.compile(DEFAULT_IGNORE)]
+        self.ignore_search = [re.compile(x) for x in args.ignore]
+
+    def ignored(self, name: str) -> bool:
+        return any(rx.fullmatch(name) for rx in self.ignore_full) or any(rx.search(name) for rx in self.ignore_search)
+
+
+def lint(sc: Scan) -> list[tuple[str, list[str]]]:
+    """[(見出し, [行...])]。問題の無い項目は含めない。"""
+    out: list[tuple[str, list[str]]] = []
+    entries = sc.ledger.entries
+    names = {e["name"] for e in entries}
+    active = [e for e in entries if e["status"].lower() not in REMOVED]
+    have_code = sc.code is not None
+    have_env = sc.env is not None
+    code = sc.code or {}
+    env = sc.env or {}
+
+    # 台帳に無いフラグ
+    unlisted = sorted((set(code) | set(env)) - names)
+    unlisted = [n for n in unlisted if not sc.ignored(n)]
+    if unlisted:
+        rows = []
+        for n in unlisted:
+            parts = []
+            if n in code:
+                parts.append("コード " + where(code[n]))
+            if n in env:
+                parts.append("設定 " + where(env[n]))
+            rows.append(f"`{n}` — " + " / ".join(parts))
+        out.append(("台帳に無いフラグ", rows))
+
+    # コードに無いのに台帳にある
+    if have_code:
+        rows = [f"`{e['name']}` — 台帳 {e['line']} 行目、状態 {e['status'] or '(空)'}" +
+                (f"。設定ファイルには残っている（{where(env[e['name']])}）" if e["name"] in env else "")
+                for e in active if e["name"] not in code]
+        if rows:
+            out.append(("コードに無いのに台帳にある", rows))
+
+    # 削除済みなのに残っている
+    rows = []
+    for e in entries:
+        if e["status"].lower() in REMOVED:
+            where_ = []
+            if e["name"] in code:
+                where_.append("コード " + where(code[e["name"]]))
+            if e["name"] in env:
+                where_.append("設定 " + where(env[e["name"]]))
+            if where_:
+                rows.append(f"`{e['name']}` — 状態は {e['status']} なのに、" + " / ".join(where_))
+    if rows:
+        out.append(("削除済みなのに残っている", rows))
+
+    # 消す条件が空
+    rows = [f"`{e['name']}` — 台帳 {e['line']} 行目" for e in active if e["remove_when"].strip().lower() in EMPTY_WORDS]
+    if rows:
+        out.append(("消す条件が空", rows))
+
+    # 目的・根拠が空
+    rows = []
+    for e in active:
+        miss = [label for key, label in (("purpose", "目的"), ("evidence", "根拠")) if e[key].strip().lower() in EMPTY_WORDS]
+        if miss:
+            rows.append(f"`{e['name']}` — {'・'.join(miss)}が空（台帳 {e['line']} 行目）")
+    if rows:
+        out.append(("目的・根拠が空", rows))
+
+    # 試験中のまま
+    rows = []
+    for e in entries:
+        if e["status"].lower() in TRIAL:
+            at = parse_added(e["added"], sc.now)
+            if at is None:
+                rows.append(f"`{e['name']}` — 入れた時刻が読めない（{e['added'] or '空'}）。経過を数えられない")
+                continue
+            hours = (sc.now - at).total_seconds() / 3600
+            if hours > sc.args.trial_hours:
+                rows.append(f"`{e['name']}` — 試験中のまま {hours:.1f} 時間（入れた時刻 {e['added']}、上限 {sc.args.trial_hours:g} 時間）。採用か削除かを決める")
+    if rows:
+        out.append((f"試験中のまま {sc.args.trial_hours:g} 時間を超えた", rows))
+
+    # 重複
+    seen: dict[str, int] = {}
+    rows = []
+    for e in entries:
+        if e["name"] in seen:
+            rows.append(f"`{e['name']}` — 台帳 {seen[e['name']]} 行目と {e['line']} 行目")
+        else:
+            seen[e["name"]] = e["line"]
+    if rows:
+        out.append(("台帳に同じ名前が複数ある", rows))
+
+    # 台帳の本番の値と、設定ファイルの値
+    if have_env:
+        rows = []
+        for e in active:
+            name = e["name"]
+            default = norm_value(e["default"])
+            effective = norm_value(e["prod"]) or default
+            if name in env:
+                observed = sorted({norm_value(v) for _, _, v in env[name]})
+                if effective not in observed:
+                    rows.append(f"`{name}` — 台帳の本番の値は {effective or '(空)'}、設定ファイルの値は {', '.join(o or '(空)' for o in observed)}（{where(env[name])}）")
+            elif effective != default:
+                rows.append(f"`{name}` — 台帳の本番の値は {effective}（既定値は {default or '(空)'}）なのに、設定ファイルに設定が無い")
+        if rows:
+            out.append(("台帳の本番の値と設定ファイルが合わない", rows))
+    return out
+
+
+def summary_line(sc: Scan) -> list[str]:
+    from collections import Counter
+    c = Counter((e["status"] or "(空)") for e in sc.ledger.entries)
+    lines = [f"- 台帳: {len(sc.ledger.entries)} 件（" + "、".join(f"{k} {v}" for k, v in c.most_common()) + "）" if sc.ledger.entries else "- 台帳: 0 件"]
+    if sc.code is not None:
+        lines.append(f"- コード: {len(sc.code)} 個のフラグを参照")
+    if sc.env is not None:
+        lines.append(f"- 設定ファイル: {len(sc.env)} 個のフラグを設定")
+    return lines
+
+
+# ---------------------------------------------------------------- 永続化
+
+# 再起動後にデータが残ること（追試）を弱める設定。見つけたら、決まりの記録（DECISIONS.md）に
+# その名前が書かれているまで止める。2026-11-02 の練習で、主ループが承認なしに
+# innodb_flush_log_at_trx_commit を下げた（気づいたのは人間で、事後の承認になった）。
+_SEP = r"[_-]"
+def _k(name: str) -> str:
+    return _SEP.join(name.split("_"))
+
+DURABILITY_RULES = [
+    # (名前, 正規表現, 何が弱まるか)
+    ("innodb_flush_log_at_trx_commit", _k("innodb_flush_log_at_trx_commit") + r"""\s*[=:\s]\s*['"]?[02]\b""", "commit ごとの redo の fsync"),
+    ("sync_binlog", _k("sync_binlog") + r"""\s*[=:\s]\s*['"]?0\b""", "binlog の fsync"),
+    ("innodb_doublewrite", _k("innodb_doublewrite") + r"""\s*[=:\s]\s*['"]?(?:0|off|false)\b|\bskip""" + _SEP + _k("innodb_doublewrite"), "doublewrite（ページの破損対策）"),
+    ("innodb_flush_method", _k("innodb_flush_method") + r"""\s*[=:\s]\s*['"]?nosync\b""", "データファイルの fsync"),
+    ("fsync", r"""(?<![\w-])fsync\s*(?:=|\s+to\s+)\s*['"]?(?:off|false|0)\b""", "PostgreSQL の fsync"),
+    ("synchronous_commit", r"""synchronous_commit\s*(?:=|\s+to\s+)\s*['"]?off\b""", "PostgreSQL の commit の WAL の書き出し"),
+    ("full_page_writes", r"""full_page_writes\s*(?:=|\s+to\s+)\s*['"]?(?:off|false|0)\b""", "PostgreSQL のページの破損対策"),
+    ("appendfsync", r"""\bappendfsync\s+['"]?no\b""", "Redis の AOF の fsync"),
+    ("tmpfs", r"""tmpfs.*(?:mysql|postgres|pgdata|redis)|(?:mysql|postgres|pgdata|redis).*tmpfs""", "DB のデータを tmpfs（メモリ）に置く"),
+]
+DURABILITY_SKIP_SUFFIXES = SKIP_SUFFIXES  # .md（文書）は読まない
+
+
+def scan_durability(roots: list[str], extra_skip: set[str]):
+    rxs = [(name, re.compile(rx, re.I), what) for name, rx, what in DURABILITY_RULES]
+    hits: list[tuple[str, str, int, str, str]] = []  # (名前, ファイル, 行, 行の中身, 何が弱まるか)
+    for fp in walk(roots, extra_skip, DURABILITY_SKIP_SUFFIXES):
+        try:
+            lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for n, raw in enumerate(lines, 1):
+            ln = raw.strip()
+            if not ln or ln[0] in "#;" or ln.startswith("-- ") or ln.startswith("//"):
+                continue
+            for name, rx, what in rxs:
+                if rx.search(ln):
+                    hits.append((name, str(fp), n, ln[:120], what))
+    return hits
+
+
+def cmd_durability(args) -> int:
+    roots = args.conf or ["."]
+    hits = scan_durability(roots, set(args.exclude))
+    dec_path = Path(args.decisions)
+    decisions = dec_path.read_text(encoding="utf-8") if dec_path.exists() else ""
+    recorded = lambda name: re.search(r"(?<![A-Za-z_])" + re.escape(name) + r"(?![A-Za-z_])", decisions, re.I) is not None
+    missing = [h for h in hits if not recorded(h[0])]
+    out = ["# flags durability", "", f"- 走査: {', '.join(roots)}", f"- 決まりの記録: {dec_path}" + ("" if dec_path.exists() else "（無い）"),
+           f"- 永続化を弱める設定: {len(hits)} か所（記録あり {len(hits) - len(missing)}、記録なし {len(missing)}）"]
+    if hits and not missing:
+        out += ["", "記録あり。再起動試験（書いたデータが再起動後に残る）を通したかは、記録の中身で確かめる。"]
+    if missing:
+        out += ["", f"## 決まりの記録が無い（{len(missing)}）", ""]
+        out += [f"- `{name}` — {Path(f).as_posix()}:{n}（{what}）: `{ln}`" for name, f, n, ln, what in missing]
+        out += ["", f"止める。入れるなら、人間の承認を取り、{dec_path} に設定の名前・理由・再起動試験の結果を書いてから反映する。"]
+    if not hits:
+        out += ["", "問題なし。"]
+    sys.stdout.write("\n".join(out) + "\n")
+    return 1 if missing else 0
+
+
+# ---------------------------------------------------------------- コマンド
+
+def build_scan(args) -> Scan:
+    ledger_path = Path(args.ledger)
+    if not ledger_path.exists():
+        raise FileNotFoundError(f"台帳が無い: {ledger_path}（flags new NAME で作れる）")
+    ledger = parse_ledger(ledger_path.read_text(encoding="utf-8"))
+    skip = {x for x in args.exclude}
+    code = scan_code(args.code, args.pattern, skip, {ledger_path.resolve()}) if args.code else None
+    env = scan_env(args.env, args.pattern, skip) if args.env else None
+    now = datetime.fromisoformat(args.now) if args.now else datetime.now()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    return Scan(ledger, code, env, args, now)
+
+
+def cmd_lint(args) -> int:
+    if not args.code and not args.env:
+        print("エラー: --code か --env が要る（両方でもよい）", file=sys.stderr)
+        return 2
+    sc = build_scan(args)
+    findings = lint(sc)
+    out = ["# flags lint", ""] + summary_line(sc)
+    if not findings:
+        out += ["", "問題なし。"]
+    for title, rows in findings:
+        out += ["", f"## {title}（{len(rows)}）", ""] + [f"- {r}" for r in rows]
+    sys.stdout.write("\n".join(out) + "\n")
+    return 1 if findings else 0
+
+
+def cmd_list(args) -> int:
+    sc = build_scan(args)
+    code, env = sc.code or {}, sc.env or {}
+    rows = []
+    for e in sc.ledger.entries:
+        vals = sorted({norm_value(v) or "(空)" for _, _, v in env.get(e["name"], [])})
+        rows.append([f"`{e['name']}`", e["status"] or "-", e["default"] or "-", e["prod"] or "-",
+                     ", ".join(vals) if vals else "-", str(len(code.get(e["name"], []))) if sc.code is not None else "?",
+                     e["added"] or "-", e["remove_when"] or "-"])
+    head = ["名前", "状態", "既定値", "本番（台帳）", "設定ファイルの値", "コード参照", "入れた時刻", "消す条件"]
+    out = ["| " + " | ".join(head) + " |", "| " + " | ".join(["---"] * 5 + ["---:", "---", "---"]) + " |"]
+    out += ["| " + " | ".join(r) + " |" for r in rows]
+    sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
+def esc_cell(s: str) -> str:
+    return s.replace("|", "\\|").replace("\n", " ")
+
+
+def cmd_new(args) -> int:
+    if not re.fullmatch(args.pattern, args.name):
+        print(f"エラー: 名前 {args.name!r} が --pattern（{args.pattern}）に合わない", file=sys.stderr)
+        return 2
+    path = Path(args.ledger)
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+    else:
+        tpl = Path(__file__).resolve().parent / "flags.template.md"
+        text = tpl.read_text(encoding="utf-8") if tpl.exists() else BUILTIN_TEMPLATE
+    ledger = parse_ledger(text)
+    if any(e["name"] == args.name for e in ledger.entries):
+        print(f"エラー: {args.name} は台帳に既にある（{path} {next(e['line'] for e in ledger.entries if e['name'] == args.name)} 行目）", file=sys.stderr)
+        return 1
+    added = args.added if args.added is not None else datetime.now().strftime("%Y-%m-%d %H:%M")
+    row = "| " + " | ".join(esc_cell(c) for c in [
+        f"`{args.name}`", args.default, args.prod, args.purpose, args.evidence, added, args.remove_when, args.status]) + " |"
+    lines = ledger.lines
+    if ledger.span is None:
+        sep = ["| " + " | ".join(HEADER_JA) + " |", "| " + " | ".join(["---"] * len(HEADER_JA)) + " |"]
+        lines = lines + ([""] if lines and lines[-1].strip() else []) + sep + [row]
+    else:
+        lines = lines[: ledger.span[1] + 1] + [row] + lines[ledger.span[1] + 1:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"{path} に {args.name} を足した。")
+    missing = [label for label, v in (("消す条件", args.remove_when), ("目的", args.purpose), ("根拠", args.evidence)) if v.strip().lower() in EMPTY_WORDS]
+    if missing:
+        print(f"注意: {'・'.join(missing)}が空。台帳を開いて埋める（lint が指摘する）。", file=sys.stderr)
+    return 0
+
+
+def add_common(p: argparse.ArgumentParser, S):
+    p.add_argument("--ledger", default=S, metavar="PATH", help="台帳（既定 flags.md）")
+    p.add_argument("--pattern", default=S, metavar="REGEX", help=f"環境変数の名前の形（既定 {DEFAULT_PATTERN}）")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    S = argparse.SUPPRESS
+    p = argparse.ArgumentParser(prog="flags", description="環境変数のフラグの台帳と、コード・設定ファイルの突き合わせ。")
+    p.add_argument("--ledger", default="flags.md", metavar="PATH", help="台帳（既定 flags.md）")
+    p.add_argument("--pattern", default=DEFAULT_PATTERN, metavar="REGEX", help=f"環境変数の名前の形（既定 {DEFAULT_PATTERN}）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def scan_args(sp):
+        add_common(sp, S)
+        sp.add_argument("--code", action="append", default=[], metavar="DIR", help="コードのディレクトリかファイル（繰り返し可）")
+        sp.add_argument("--env", action="append", default=[], metavar="DIR", help="設定ファイル（systemd の drop-in・env ファイル）のディレクトリかファイル（繰り返し可）")
+        sp.add_argument("--exclude", action="append", default=[], metavar="NAME", help="走査から外すディレクトリ名（繰り返し可。.git・node_modules・target などは既定で外す）")
+        sp.add_argument("--ignore", action="append", default=[], metavar="REGEX", help="フラグではない設定として無視する名前（繰り返し可。例: '^DB_'）")
+        sp.add_argument("--no-default-ignore", action="store_true", help="PATH・HOME・RUST_LOG などの既定の無視リストを使わない")
+        sp.add_argument("--now", metavar="ISO", help="今の時刻（試験用。既定は現在）")
+        sp.add_argument("--trial-hours", type=float, default=3.0, metavar="N", help="試験中のままで許す時間（既定 3）")
+
+    l = sub.add_parser("lint", help="台帳・コード・設定ファイルを突き合わせる（問題があれば終了コード 1）")
+    scan_args(l)
+    ls = sub.add_parser("list", help="台帳のフラグ 1 つにつき 1 行で、設定ファイルの値とコードの参照数を並べる")
+    scan_args(ls)
+    d = sub.add_parser("durability", help="永続化を弱める DB の設定を探し、決まりの記録に名前が無ければ止める（終了コード 1）")
+    d.add_argument("--conf", action="append", default=[], metavar="DIR", help="設定ファイル・compose・SQL のディレクトリかファイル（繰り返し可。既定 .）")
+    d.add_argument("--decisions", default="docs/DECISIONS.md", metavar="PATH", help="決まりの記録（既定 docs/DECISIONS.md）")
+    d.add_argument("--exclude", action="append", default=[], metavar="NAME", help="走査から外すディレクトリ名（繰り返し可）")
+    n = sub.add_parser("new", help="台帳に行を足す（台帳が無ければ雛形から作る）")
+    add_common(n, S)
+    n.add_argument("name", metavar="NAME")
+    n.add_argument("--default", default="", help="既定値")
+    n.add_argument("--prod", default="", help="本番の値")
+    n.add_argument("--purpose", default="", help="目的")
+    n.add_argument("--evidence", default="", help="根拠（PR / 計測）")
+    n.add_argument("--added", default=None, help="入れた時刻（既定は今。例 2026-10-31 14:05）")
+    n.add_argument("--remove-when", default="", help="消す条件")
+    n.add_argument("--status", default="試験中", help="状態（既定 試験中）")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
+    args = p.parse_args(argv)
+    try:
+        re.compile(args.pattern)
+        return {"lint": cmd_lint, "list": cmd_list, "new": cmd_new, "durability": cmd_durability}[args.cmd](args)
+    except (OSError, re.error, ValueError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

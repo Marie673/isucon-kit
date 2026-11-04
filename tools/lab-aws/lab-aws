@@ -1,0 +1,815 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""手元の再現を、本番と同じ CPU の系統の EC2 で回すための道具（ISUCON 用の実験室）。
+
+    lab-aws up --type c5.large --count 2 --ttl 2h --yes
+    lab-aws list
+    lab-aws push ./webapp                  # 作業木を全台へ送る
+    lab-aws run -- 'cargo bench'           # 全台で実行
+    lab-aws fetch work/webapp/target/criterion
+    lab-aws cpuinfo                        # 各台の /proc/cpuinfo を持ち帰る（cpu-features の入力）
+    lab-aws down                           # この実験室の台を終了
+    lab-aws sweep                          # 期限を過ぎた残りを終了
+
+安全装置: タグ purpose=isucon-lab の付いたものだけを作る・見る・消す。台は自分で止まる（ttl）。
+同時数の上限（LAB_MAX_INSTANCES）が未設定なら up は動かない。--dry-run は aws も ssh も実行せず、コマンドを + で表示するだけ。
+AWS を作る・消す操作（run-instances / terminate-instances）は、この道具の up / down / sweep だけが実行する。
+設定は環境変数か .env（LAB_*、AWS_PROFILE、AWS_REGION だけ読む。環境変数が先）。README を参照。
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence
+
+PURPOSE = "isucon-lab"
+DEFAULT_ALLOWED_FAMILIES = "c5,c5n,c6i,c6a,c7i,c7a,m5,m6i,m7i"
+DEFAULT_MAX_TTL_MIN = 240
+MIN_TTL_MIN = 10
+ALLOWED_SIZES = ("medium", "large", "xlarge", "2xlarge", "4xlarge")
+TERMINATE_STATES = "pending,running,stopping,stopped"
+SSH_EXCLUDES = [
+    ".git/", ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
+    ".cache/", "target/", "node_modules/", ".venv/",
+]
+EXIT_USAGE = 2
+EXIT_CONFIG = 3
+EXIT_AWS = 4
+
+
+class LabError(Exception):
+    def __init__(self, msg: str, code: int = EXIT_USAGE):
+        super().__init__(msg)
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------------------
+def read_dotenv(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if not (k.startswith("LAB_") or k in ("AWS_PROFILE", "AWS_REGION")):
+            continue
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        if v:
+            out[k] = v
+    return out
+
+
+@dataclass
+class Config:
+    profile: str = ""
+    region: str = ""
+    max_instances: Optional[int] = None
+    key_name: str = ""
+    ssh_key: str = ""
+    sg_id: str = ""
+    subnet_id: str = ""
+    ssh_user: str = "ubuntu"
+    ami: str = ""
+    ubuntu_version: str = "24.04"
+    root_device: str = "/dev/sda1"
+    volume_gb: int = 30
+    max_ttl_min: int = DEFAULT_MAX_TTL_MIN
+    allowed_families: List[str] = field(default_factory=lambda: DEFAULT_ALLOWED_FAMILIES.split(","))
+    spot: bool = False
+    host_field: str = "public"
+    state_dir: Path = Path(".cache/lab-aws")
+    aws_bin: str = "aws"
+    user_data_file: str = ""
+
+    @classmethod
+    def load(cls, env: Dict[str, str], cwd: Path) -> "Config":
+        merged = dict(read_dotenv(cwd / ".env"))
+        merged.update({k: v for k, v in env.items() if v != "" and (k.startswith("LAB_") or k in ("AWS_PROFILE", "AWS_REGION"))})
+        c = cls()
+        c.profile = merged.get("AWS_PROFILE", "")
+        c.region = merged.get("AWS_REGION", "")
+        c.key_name = merged.get("LAB_KEY_NAME", "")
+        c.ssh_key = merged.get("LAB_SSH_KEY", "")
+        c.sg_id = merged.get("LAB_SG_ID", "")
+        c.subnet_id = merged.get("LAB_SUBNET_ID", "")
+        c.ssh_user = merged.get("LAB_SSH_USER", c.ssh_user)
+        c.ami = merged.get("LAB_AMI", "")
+        c.ubuntu_version = merged.get("LAB_UBUNTU_VERSION", c.ubuntu_version)
+        c.root_device = merged.get("LAB_ROOT_DEVICE", c.root_device)
+        c.aws_bin = merged.get("LAB_AWS_BIN", c.aws_bin)
+        c.user_data_file = merged.get("LAB_USER_DATA_FILE", "")
+        c.spot = merged.get("LAB_SPOT", "") == "1"
+        hf = merged.get("LAB_HOST_FIELD", "public")
+        if hf not in ("public", "private"):
+            raise LabError("LAB_HOST_FIELD は public か private（今: %s）" % hf, EXIT_CONFIG)
+        c.host_field = hf
+        c.state_dir = Path(merged.get("LAB_STATE_DIR", str(cwd / ".cache/lab-aws")))
+        for key, attr in (("LAB_MAX_INSTANCES", "max_instances"), ("LAB_VOLUME_GB", "volume_gb"), ("LAB_MAX_TTL_MIN", "max_ttl_min")):
+            if key in merged:
+                if not re.fullmatch(r"[1-9][0-9]*", merged[key]):
+                    raise LabError("%s は正の整数（今: %s）" % (key, merged[key]), EXIT_CONFIG)
+                setattr(c, attr, int(merged[key]))
+        if "LAB_ALLOWED_FAMILIES" in merged:
+            c.allowed_families = [x.strip() for x in merged["LAB_ALLOWED_FAMILIES"].split(",") if x.strip()]
+        return c
+
+
+# ---------------------------------------------------------------------------
+# 実行の土台（aws / ssh / rsync を呼ぶ口。--dry-run では表示だけ。テストでは runner を差し替える）
+# ---------------------------------------------------------------------------
+Runner = Callable[..., "subprocess.CompletedProcess"]
+
+
+def default_runner(argv: Sequence[str], capture: bool = True, check: bool = False, stdout_path: Optional[Path] = None) -> "subprocess.CompletedProcess":
+    if stdout_path is not None:
+        with open(stdout_path, "wb") as f:
+            return subprocess.run(list(argv), stdout=f)
+    if capture:
+        return subprocess.run(list(argv), capture_output=True, text=True)
+    return subprocess.run(list(argv))
+
+
+def shq(argv: Sequence[str]) -> str:
+    return " ".join(a if re.fullmatch(r"[A-Za-z0-9_@%+=:,./~-]+", a) else shlex.quote(a) for a in argv)
+
+
+@dataclass
+class Ctx:
+    cfg: Config
+    dry: bool = False
+    runner: Runner = default_runner
+    out: Callable[[str], None] = lambda s: print(s)
+    err: Callable[[str], None] = lambda s: print(s, file=sys.stderr)
+    now: Callable[[], float] = time.time
+    allowed_ops: frozenset = frozenset()  # 実行してよい変更系の aws 操作
+
+    def plan(self, argv: Sequence[str]) -> None:
+        self.err("+ " + shq(argv))
+
+    def log(self, msg: str) -> None:
+        self.err("lab-aws: " + msg)
+
+
+def aws_is_read(args: Sequence[str]) -> bool:
+    """読み取りだけの呼び出しか。変更系は up / down / sweep の許可した操作だけが通る。"""
+    if len(args) < 2:
+        return False
+    op = args[1]
+    return op.startswith(("describe-", "get-", "list-", "head-")) or op == "wait"
+
+
+def aws_argv(ctx: Ctx, args: Sequence[str]) -> List[str]:
+    argv = [ctx.cfg.aws_bin]
+    if ctx.cfg.profile:
+        argv += ["--profile", ctx.cfg.profile]
+    if ctx.cfg.region:
+        argv += ["--region", ctx.cfg.region]
+    return argv + list(args)
+
+
+def aws(ctx: Ctx, args: Sequence[str]) -> "subprocess.CompletedProcess":
+    argv = aws_argv(ctx, args)
+    if not aws_is_read(args) and args[1] not in ctx.allowed_ops:
+        raise LabError("内部エラー: 許可していない変更系の aws 操作を拒否した: %s" % " ".join(args[:2]), EXIT_AWS)
+    if ctx.dry:
+        ctx.plan(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    r = ctx.runner(argv)
+    if r.returncode != 0:
+        raise LabError("aws が失敗した（%s）: %s" % (" ".join(args[:2]), (r.stderr or "").strip()[:400]), EXIT_AWS)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# 台（タグ purpose=isucon-lab の EC2）
+# ---------------------------------------------------------------------------
+@dataclass
+class Node:
+    id: str
+    state: str
+    itype: str
+    lab: str
+    index: int
+    launch: float
+    expires: Optional[float]
+    public_ip: str
+    private_ip: str
+
+    def host(self, field_: str) -> str:
+        ip = self.public_ip if field_ == "public" else self.private_ip
+        if not ip:
+            raise LabError("%s に %s の IP が無い（状態: %s）。起動直後なら少し待つか、LAB_HOST_FIELD を見直す" % (self.id, field_, self.state), EXIT_AWS)
+        return ip
+
+
+def parse_iso(t: str) -> float:
+    from datetime import datetime, timezone
+    t = t.replace("Z", "+00:00")
+    return datetime.fromisoformat(t).astimezone(timezone.utc).timestamp()
+
+
+def parse_nodes(doc: str) -> List[Node]:
+    """describe-instances の JSON から台を作る。タグ purpose=isucon-lab でないものは、フィルターが効かなくても捨てる。"""
+    data = json.loads(doc or "{}")
+    nodes: List[Node] = []
+    for res in data.get("Reservations", []):
+        for ins in res.get("Instances", []):
+            tags = {t["Key"]: t["Value"] for t in ins.get("Tags", [])}
+            if tags.get("purpose") != PURPOSE:
+                continue
+            exp = tags.get("lab-expires", "")
+            nodes.append(Node(
+                id=ins["InstanceId"],
+                state=ins.get("State", {}).get("Name", "unknown"),
+                itype=ins.get("InstanceType", ""),
+                lab=tags.get("lab-id", ""),
+                index=int(tags["lab-node"]) if tags.get("lab-node", "").isdigit() else 0,
+                launch=parse_iso(ins["LaunchTime"]) if ins.get("LaunchTime") else 0.0,
+                expires=float(exp) if re.fullmatch(r"\d+", exp) else None,
+                public_ip=ins.get("PublicIpAddress", "") or "",
+                private_ip=ins.get("PrivateIpAddress", "") or "",
+            ))
+    nodes.sort(key=lambda n: (n.lab, n.index, n.id))
+    return nodes
+
+
+def describe(ctx: Ctx, lab: Optional[str] = None, states: str = TERMINATE_STATES) -> List[Node]:
+    args = ["ec2", "describe-instances",
+            "--filters", "Name=tag:purpose,Values=%s" % PURPOSE, "Name=instance-state-name,Values=%s" % states]
+    if lab:
+        args.append("Name=tag:lab-id,Values=%s" % lab)
+    args += ["--output", "json"]
+    r = aws(ctx, args)
+    nodes = parse_nodes(r.stdout)
+    if lab:
+        nodes = [n for n in nodes if n.lab == lab]
+    return nodes
+
+
+def pick_lab(ctx: Ctx, nodes: List[Node], lab: Optional[str]) -> str:
+    labs = sorted({n.lab for n in nodes if n.lab})
+    if lab:
+        if lab not in labs:
+            raise LabError("実験室 %s の台が見つからない（list で確認）" % lab)
+        return lab
+    if len(labs) == 1:
+        return labs[0]
+    if not labs:
+        raise LabError("起動中の実験室が無い（up で作る）")
+    raise LabError("実験室が複数ある: %s。--lab で指定する" % ", ".join(labs))
+
+
+def select_nodes(nodes: List[Node], lab: str, node: Optional[int], need_one: bool = False) -> List[Node]:
+    sel = [n for n in nodes if n.lab == lab and n.state == "running"]
+    if node is not None:
+        sel = [n for n in sel if n.index == node]
+        if not sel:
+            raise LabError("台 %d が見つからない（running のものだけ選べる）" % node)
+    if not sel:
+        raise LabError("running の台が無い（list で状態を確認）")
+    if need_one and len(sel) > 1:
+        raise LabError("台が複数ある（%s）。--node で指定する" % ", ".join(str(n.index) for n in sel))
+    return sel
+
+
+# ---------------------------------------------------------------------------
+# up
+# ---------------------------------------------------------------------------
+def parse_ttl(s: str) -> int:
+    m = re.fullmatch(r"(\d+)\s*([mh]?)", s.strip().lower())
+    if not m:
+        raise LabError("--ttl は 90m / 2h / 120（分）の形で（今: %s）" % s)
+    n = int(m.group(1))
+    return n * 60 if m.group(2) == "h" else n
+
+
+def instance_family(itype: str) -> str:
+    return itype.split(".", 1)[0]
+
+
+def validate_type(cfg: Config, itype: str) -> None:
+    m = re.fullmatch(r"([a-z0-9]+)\.([a-z0-9]+)", itype)
+    if not m:
+        raise LabError("インスタンスの種類の形が不正: %s" % itype)
+    fam, size = m.groups()
+    if size not in ALLOWED_SIZES:
+        raise LabError("サイズ %s は許していない（%s だけ）" % (size, " / ".join(ALLOWED_SIZES)))
+    if fam not in cfg.allowed_families:
+        raise LabError("系統 %s は許可リストに無い（LAB_ALLOWED_FAMILIES: %s）。増やすのは承認を取ってから" % (fam, ",".join(cfg.allowed_families)))
+
+
+def is_arm_family(itype: str) -> bool:
+    return re.fullmatch(r"(a1|[a-z]+[0-9]+g[a-z]*)", instance_family(itype)) is not None
+
+
+def ami_arg(cfg: Config, itype: str) -> str:
+    if cfg.ami:
+        return cfg.ami
+    arch = "arm64" if is_arm_family(itype) else "amd64"
+    return "resolve:ssm:/aws/service/canonical/ubuntu/server/%s/stable/current/%s/hvm/ebs-gp3/ami-id" % (cfg.ubuntu_version, arch)
+
+
+def make_user_data(ttl_min: int, extra: str = "") -> str:
+    # 最初に自動停止を予約する（終了動作は terminate。道具が死んでも ttl で消える）
+    s = '#!/bin/bash\nshutdown -h +%d "isucon-lab ttl %dmin"\n' % (ttl_min, ttl_min)
+    if extra:
+        s += extra if extra.endswith("\n") else extra + "\n"
+    return s
+
+
+def new_lab_id(ctx: Ctx) -> str:
+    t = time.strftime("%Y%m%d-%H%M%S", time.localtime(ctx.now()))
+    return "lab-%s-%04x" % (t, random.randrange(0x10000))
+
+
+def run_instances_args(cfg: Config, lab: str, idx: int, itype: str, ttl_min: int, owner: str, expires: int, user_data: str) -> List[str]:
+    token = hashlib.sha256(("%s/%d" % (lab, idx)).encode()).hexdigest()[:32]
+    tags = "{Key=purpose,Value=%s},{Key=Name,Value=isucon-lab-%s-%d},{Key=lab-id,Value=%s},{Key=lab-node,Value=%d},{Key=lab-owner,Value=%s},{Key=lab-expires,Value=%d}" % (
+        PURPOSE, lab, idx, lab, idx, owner, expires)
+    args = ["ec2", "run-instances", "--client-token", token,
+            "--image-id", ami_arg(cfg, itype),
+            "--instance-type", itype, "--count", "1",
+            "--key-name", cfg.key_name or "<LAB_KEY_NAME>",
+            "--security-group-ids", cfg.sg_id or "<LAB_SG_ID>"]
+    if cfg.subnet_id:
+        args += ["--subnet-id", cfg.subnet_id]
+    args += [
+        "--instance-initiated-shutdown-behavior", "terminate",
+        "--metadata-options", "HttpTokens=required,HttpEndpoint=enabled",
+        "--block-device-mappings", "DeviceName=%s,Ebs={VolumeSize=%d,VolumeType=gp3,DeleteOnTermination=true}" % (cfg.root_device, cfg.volume_gb),
+        "--tag-specifications",
+        "ResourceType=instance,Tags=[%s]" % tags,
+        "ResourceType=volume,Tags=[{Key=purpose,Value=%s},{Key=lab-id,Value=%s}]" % (PURPOSE, lab),
+        "--user-data", user_data,
+        "--query", "Instances[0].InstanceId", "--output", "text",
+    ]
+    if cfg.spot:
+        args += ["--instance-market-options", "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}"]
+    return args
+
+
+def cmd_up(ctx: Ctx, a: argparse.Namespace) -> int:
+    cfg = ctx.cfg
+    ttl = parse_ttl(a.ttl)
+    if ttl < MIN_TTL_MIN or ttl > cfg.max_ttl_min:
+        raise LabError("--ttl は %d〜%d 分（LAB_MAX_TTL_MIN）。今: %d 分" % (MIN_TTL_MIN, cfg.max_ttl_min, ttl))
+    validate_type(cfg, a.type)
+    if a.count < 1:
+        raise LabError("--count は 1 以上")
+    missing = [n for n, v in (("LAB_MAX_INSTANCES", cfg.max_instances), ("LAB_KEY_NAME", cfg.key_name), ("LAB_SG_ID", cfg.sg_id)) if not v]
+    if missing:
+        if not ctx.dry:
+            raise LabError("設定が足りない: %s。同時数・種類・時間・費用は人間の承認が先（README の「使う前に」）。空のままが未承認の間の安全装置" % ", ".join(missing), EXIT_CONFIG)
+        ctx.log("(dry-run) 未設定: %s → 仮の表示にする" % ", ".join(missing))
+    limit = cfg.max_instances or 1
+    if a.count > limit and not (ctx.dry and not cfg.max_instances):
+        raise LabError("--count %d は同時数の上限 LAB_MAX_INSTANCES=%d を超える" % (a.count, limit), EXIT_CONFIG)
+    if not ctx.dry and not a.yes:
+        raise LabError("AWS に台を作る。内容を --dry-run で確かめ、人間の承認を得てから --yes を付ける", EXIT_USAGE)
+
+    lab = new_lab_id(ctx)
+    expires = int(ctx.now()) + ttl * 60
+    owner = os.environ.get("USER", "unknown")
+    extra = ""
+    if cfg.user_data_file:
+        extra = Path(cfg.user_data_file).read_text()
+    user_data = make_user_data(ttl, extra)
+
+    ctx.log("実験室 %s: %s x %d（ttl %d 分、自動停止）%s%s" % (
+        lab, a.type, a.count, ttl, " リージョン=" + cfg.region if cfg.region else "", " プロファイル=" + cfg.profile if cfg.profile else ""))
+    ctx.allowed_ops = frozenset({"run-instances"})
+    if not ctx.dry:
+        running = describe(ctx, states="pending,running")
+        if len(running) + a.count > limit:
+            raise LabError("起動中 %d 台 + 今回 %d 台が上限 %d を超える。list / sweep / down で片付ける" % (len(running), a.count, limit), EXIT_CONFIG)
+    else:
+        describe(ctx, states="pending,running")
+    ids: List[str] = []
+    for idx in range(1, a.count + 1):
+        args = run_instances_args(cfg, lab, idx, a.type, ttl, owner, expires, user_data)
+        try:
+            r = aws(ctx, args)
+        except LabError as e:
+            if ids:
+                ctx.log("途中で失敗。作れた台: %s（ttl で自動停止する。down --lab %s で消せる）" % (", ".join(ids), lab))
+            raise e
+        iid = (r.stdout or "").strip()
+        if ctx.dry:
+            ids.append("i-DRYRUN%d" % idx)
+        elif re.fullmatch(r"i-[0-9a-f]+", iid):
+            ids.append(iid)
+        else:
+            raise LabError("run-instances の応答が読めない: %r。list で確認し、down --lab %s で消す" % (iid, lab), EXIT_AWS)
+    ctx.allowed_ops = frozenset()
+    aws(ctx, ["ec2", "wait", "instance-running", "--instance-ids", *ids])
+    nodes = describe(ctx, lab, states="pending,running") if not ctx.dry else []
+    if not ctx.dry:
+        print_nodes(ctx, nodes)
+    ctx.out("実験室: %s（%d 台、%d 分で自動停止）" % (lab, a.count, ttl))
+    ctx.out("次: lab-aws ssh --lab %s / push <dir> / run -- <cmd> / down --lab %s" % (lab, lab))
+    ctx.out("起動直後は ssh が通るまで 30〜60 秒かかることがある。")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# list / down / sweep
+# ---------------------------------------------------------------------------
+def print_nodes(ctx: Ctx, nodes: List[Node]) -> None:
+    now = ctx.now()
+    ctx.out("実験室\t台\tID\t状態\t種類\t経過(分)\t残り(分)\tpublic IP\tprivate IP")
+    for n in nodes:
+        age = int((now - n.launch) / 60) if n.launch else -1
+        left = int((n.expires - now) / 60) if n.expires else None
+        ctx.out("%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s" % (
+            n.lab, n.index, n.id, n.state, n.itype, age, "?" if left is None else left, n.public_ip or "-", n.private_ip or "-"))
+
+
+def cmd_list(ctx: Ctx, a: argparse.Namespace) -> int:
+    nodes = describe(ctx, a.lab)
+    if ctx.dry:
+        return 0
+    if a.json:
+        ctx.out(json.dumps([n.__dict__ for n in nodes], ensure_ascii=False, indent=2))
+        return 0
+    if not nodes:
+        ctx.out("残っている台は無い（purpose=%s）" % PURPOSE)
+        return 0
+    print_nodes(ctx, nodes)
+    return 0
+
+
+def terminate(ctx: Ctx, nodes: List[Node]) -> None:
+    """タグ付きの台として describe で確かめたものだけを終了する。"""
+    ids = [n.id for n in nodes]
+    if not ids:
+        return
+    for i in ids:
+        if not re.fullmatch(r"i-[0-9a-f]+", i):
+            raise LabError("不正な ID: %s" % i, EXIT_AWS)
+    ctx.allowed_ops = frozenset({"terminate-instances"})
+    try:
+        aws(ctx, ["ec2", "terminate-instances", "--instance-ids", *ids, "--query", "TerminatingInstances[].[InstanceId,CurrentState.Name]", "--output", "text"])
+    finally:
+        ctx.allowed_ops = frozenset()
+    ctx.log("終了を依頼した: %s" % ", ".join(ids))
+
+
+def cmd_down(ctx: Ctx, a: argparse.Namespace) -> int:
+    if a.all and a.lab:
+        raise LabError("--all と --lab は一緒に使えない")
+    nodes = describe(ctx, a.lab)
+    if ctx.dry:
+        ctx.log("(dry-run) 上で選んだ台（タグ purpose=%s）だけを terminate-instances する" % PURPOSE)
+        ctx.plan(aws_argv(ctx, ["ec2", "terminate-instances", "--instance-ids", "<上で選んだ ID>"]))
+        return 0
+    if not nodes:
+        ctx.log("終了するものは無い")
+        return 0
+    if not a.all:
+        lab = pick_lab(ctx, nodes, a.lab)
+        nodes = [n for n in nodes if n.lab == lab]
+    for n in nodes:
+        ctx.log("終了する: %s（%s, %s, 実験室 %s 台 %d）" % (n.id, n.state, n.itype, n.lab, n.index))
+    terminate(ctx, nodes)
+    return 0
+
+
+def cmd_sweep(ctx: Ctx, a: argparse.Namespace) -> int:
+    nodes = describe(ctx)
+    if ctx.dry:
+        ctx.log("(dry-run) 期限（lab-expires）+ %d 分を過ぎた台だけを terminate-instances する" % a.grace)
+        ctx.plan(aws_argv(ctx, ["ec2", "terminate-instances", "--instance-ids", "<期限切れの ID>"]))
+        return 0
+    now = ctx.now()
+    expired: List[Node] = []
+    alive: List[Node] = []
+    for n in nodes:
+        deadline = n.expires if n.expires else (n.launch + ctx.cfg.max_ttl_min * 60)
+        (expired if now >= deadline + a.grace * 60 else alive).append(n)
+    if alive:
+        ctx.log("まだ期限内（残す）: %s" % ", ".join("%s(%s)" % (n.id, n.lab) for n in alive))
+    if not expired:
+        ctx.log("期限を過ぎた台は無い")
+        return 0
+    for n in expired:
+        ctx.log("期限切れ: %s（実験室 %s、状態 %s）" % (n.id, n.lab, n.state))
+    terminate(ctx, expired)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# ssh / push / run / fetch / cpuinfo
+# ---------------------------------------------------------------------------
+def ssh_base(cfg: Config, lab: str) -> List[str]:
+    if not cfg.ssh_key:
+        raise LabError("LAB_SSH_KEY が未設定（鍵のパス）", EXIT_CONFIG)
+    kh = cfg.state_dir / lab / "known_hosts"
+    return ["-i", os.path.expanduser(cfg.ssh_key),
+            "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=%s" % kh, "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30"]
+
+
+def ssh_argv(ctx: Ctx, lab: str, node: Node, remote: str = "", tty: bool = False) -> List[str]:
+    """remote は台の shell に渡す 1 本の文字列（ssh は引数を空白でつなぐので、呼ぶ側が引用を済ませる）。"""
+    argv = ["ssh"] + (["-t"] if tty else []) + ssh_base(ctx.cfg, lab) + ["%s@%s" % (ctx.cfg.ssh_user, node.host(ctx.cfg.host_field))]
+    return argv + ([remote] if remote else [])
+
+
+def prepare_known_hosts(ctx: Ctx, lab: str) -> None:
+    if ctx.dry:
+        return
+    (ctx.cfg.state_dir / lab).mkdir(parents=True, exist_ok=True)
+
+
+def resolve(ctx: Ctx, a: argparse.Namespace, need_one: bool = False) -> "tuple[str, List[Node]]":
+    """起動中の台を引く。--dry-run では aws を呼ばず、仮の台を 1 つ返す。"""
+    if ctx.dry:
+        describe(ctx, getattr(a, "lab", None), states="running")
+        n = Node("i-DRYRUN", "running", "?", getattr(a, "lab", None) or "<lab>", getattr(a, "node", None) or 1, 0.0, None, "<ip>", "<ip>")
+        return n.lab, [n]
+    nodes = describe(ctx, getattr(a, "lab", None), states="pending,running")
+    lab = pick_lab(ctx, nodes, getattr(a, "lab", None))
+    return lab, select_nodes(nodes, lab, getattr(a, "node", None), need_one)
+
+
+def run_cmd(ctx: Ctx, argv: List[str], interactive: bool = False) -> int:
+    if ctx.dry:
+        ctx.plan(argv)
+        return 0
+    r = ctx.runner(argv, capture=False)
+    return r.returncode
+
+
+def cmd_ssh(ctx: Ctx, a: argparse.Namespace) -> int:
+    lab, nodes = resolve(ctx, a, need_one=True)
+    prepare_known_hosts(ctx, lab)
+    return run_cmd(ctx, ssh_argv(ctx, lab, nodes[0], remote_command(a.cmd, None) if a.cmd else "", tty=not a.cmd), interactive=True)
+
+
+def rsync_ssh_e(ctx: Ctx, lab: str) -> str:
+    return "ssh " + shq(ssh_base(ctx.cfg, lab))
+
+
+def cmd_push(ctx: Ctx, a: argparse.Namespace) -> int:
+    src = Path(a.dir)
+    if not src.is_dir():
+        raise LabError("送る元がディレクトリではない: %s" % a.dir)
+    dest = a.dest or "work/%s" % src.resolve().name
+    lab, nodes = resolve(ctx, a)
+    prepare_known_hosts(ctx, lab)
+    rc = 0
+    for n in nodes:
+        target = "%s@%s" % (ctx.cfg.ssh_user, n.host(ctx.cfg.host_field))
+        ctx.log("台 %d（%s）へ送る → %s" % (n.index, n.id, dest))
+        c = run_cmd(ctx, ssh_argv(ctx, lab, n, "mkdir -p " + shlex.quote(dest)))
+        if c == 0:
+            argv = ["rsync", "-az"] + (["--delete"] if a.delete else []) + ["--include=.env.example"]
+            for ex in SSH_EXCLUDES + list(a.exclude or []):
+                argv += ["--exclude=%s" % ex]
+            argv += ["-e", rsync_ssh_e(ctx, lab), str(src).rstrip("/") + "/", "%s:%s/" % (target, dest)]
+            c = run_cmd(ctx, argv)
+        rc = rc or c
+    return rc
+
+
+def remote_command(cmd: Sequence[str], workdir: Optional[str]) -> str:
+    body = cmd[0] if len(cmd) == 1 else " ".join(shlex.quote(c) for c in cmd)
+    if workdir:
+        body = "cd %s && %s" % (shlex.quote(workdir), body)
+    return body
+
+
+def cmd_run(ctx: Ctx, a: argparse.Namespace) -> int:
+    if not a.cmd:
+        raise LabError("実行するコマンドを -- の後ろに書く")
+    lab, nodes = resolve(ctx, a)
+    prepare_known_hosts(ctx, lab)
+    body = remote_command(a.cmd, a.dir)
+    rc = 0
+    for n in nodes:
+        ctx.log("== 台 %d（%s %s）==" % (n.index, n.id, n.itype))
+        c = run_cmd(ctx, ssh_argv(ctx, lab, n, "bash -lc " + shlex.quote(body)))
+        rc = rc or c
+    return rc
+
+
+def cmd_fetch(ctx: Ctx, a: argparse.Namespace) -> int:
+    lab, nodes = resolve(ctx, a)
+    prepare_known_hosts(ctx, lab)
+    base = Path(a.to) if a.to else ctx.cfg.state_dir / lab / "fetch"
+    rc = 0
+    for n in nodes:
+        out = base / ("node%d" % n.index)
+        if not ctx.dry:
+            out.mkdir(parents=True, exist_ok=True)
+        argv = ["rsync", "-az", "-e", rsync_ssh_e(ctx, lab),
+                "%s@%s:%s" % (ctx.cfg.ssh_user, n.host(ctx.cfg.host_field), a.remote), "%s/" % out]
+        ctx.log("台 %d から持ち帰る → %s" % (n.index, out))
+        c = run_cmd(ctx, argv)
+        rc = rc or c
+    return rc
+
+
+def cmd_cpuinfo(ctx: Ctx, a: argparse.Namespace) -> int:
+    lab, nodes = resolve(ctx, a)
+    prepare_known_hosts(ctx, lab)
+    base = Path(a.to) if a.to else ctx.cfg.state_dir / lab / "cpuinfo"
+    if not ctx.dry:
+        base.mkdir(parents=True, exist_ok=True)
+    rc = 0
+    files: List[str] = []
+    for n in nodes:
+        path = base / ("node%d.cpuinfo" % n.index)
+        argv = ssh_argv(ctx, lab, n, "cat /proc/cpuinfo")
+        if ctx.dry:
+            ctx.plan(argv + [">", str(path)])
+            c = 0
+        else:
+            r = ctx.runner(argv, stdout_path=path)
+            c = r.returncode
+        rc = rc or c
+        files.append("node%d=%s" % (n.index, path))
+    if rc == 0:
+        ctx.out("次: cpu-features %s" % " ".join(files))
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# price（読み取りだけ。確かめられなければ「要確認」）
+# ---------------------------------------------------------------------------
+REGION_LOCATIONS = {
+    "ap-northeast-1": "Asia Pacific (Tokyo)",
+    "ap-northeast-3": "Asia Pacific (Osaka)",
+    "us-east-1": "US East (N. Virginia)",
+    "us-west-2": "US West (Oregon)",
+    "eu-west-1": "EU (Ireland)",
+}
+
+
+def parse_price(price_list: Sequence[str]) -> Optional[float]:
+    """pricing get-products の PriceList（JSON 文字列の配列）からオンデマンドの時間単価（USD）を取る。"""
+    for item in price_list:
+        try:
+            doc = json.loads(item) if isinstance(item, str) else item
+            for term in doc["terms"]["OnDemand"].values():
+                for dim in term["priceDimensions"].values():
+                    usd = float(dim["pricePerUnit"]["USD"])
+                    if usd > 0:
+                        return usd
+        except (KeyError, ValueError, TypeError):
+            continue
+    return None
+
+
+def price_args(itype: str, location: str) -> List[str]:
+    f = lambda k, v: "Type=TERM_MATCH,Field=%s,Value=%s" % (k, v)
+    return ["pricing", "get-products", "--service-code", "AmazonEC2", "--filters",
+            f("instanceType", itype), f("location", location), f("operatingSystem", "Linux"), f("tenancy", "Shared"),
+            f("preInstalledSw", "NA"), f("capacitystatus", "Used"), "--output", "json"]
+
+
+def cmd_price(ctx: Ctx, a: argparse.Namespace) -> int:
+    validate_type(ctx.cfg, a.type)
+    loc = REGION_LOCATIONS.get(ctx.cfg.region)
+    if not loc:
+        ctx.out("単価: 要確認（リージョン %r の場所名を知らない。AWS の料金表で確認する）" % ctx.cfg.region)
+        return 0
+    args = price_args(a.type, loc)
+    # Pricing API は us-east-1 のエンドポイントだけにある。別リージョンの価格は location で選ぶ
+    cfg = Config(**{**ctx.cfg.__dict__, "region": "us-east-1"})
+    pctx = Ctx(cfg, ctx.dry, ctx.runner, ctx.out, ctx.err, ctx.now)
+    r = aws(pctx, args)
+    if ctx.dry:
+        return 0
+    try:
+        usd = parse_price(json.loads(r.stdout or "{}").get("PriceList", []))
+    except ValueError:
+        usd = None
+    if usd is None:
+        ctx.out("単価: 要確認（Pricing API から引けなかった）")
+        return 0
+    hours = a.hours
+    ctx.out("%s（%s、オンデマンド・Linux）: $%.4f / 時間" % (a.type, loc, usd))
+    ctx.out("目安: %d 台 x %.1f 時間 = $%.2f（ディスクと転送は別。上限は台数 x ttl x 単価）" % (a.count, hours, usd * a.count * hours))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dry-run", action="store_true", help="aws / ssh / rsync を実行せず、コマンドを + で表示する")
+    sel = argparse.ArgumentParser(add_help=False, parents=[common])
+    sel.add_argument("--lab", help="実験室の ID（台が 1 つの実験室だけなら省略できる）")
+    sel.add_argument("--node", type=int, help="台の番号（省略時は全台。ssh は 1 台だけ選ぶ）")
+
+    ap = argparse.ArgumentParser(prog="lab-aws", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--profile", help="AWS_PROFILE を上書き")
+    ap.add_argument("--region", help="AWS_REGION を上書き")
+    sp = ap.add_subparsers(dest="command", required=True)
+
+    p = sp.add_parser("up", parents=[common], help="台を作る（変更系。--yes が要る）")
+    p.add_argument("--type", required=True, help="例: c5.large（本番の台と同じ系統）")
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--ttl", default="2h", help="自動停止までの時間（90m / 2h / 分）。既定 2h")
+    p.add_argument("--yes", action="store_true", help="人間の承認を得た印（--dry-run では不要）")
+    p.set_defaults(fn=cmd_up)
+
+    p = sp.add_parser("list", parents=[common], help="残っている台（タグ purpose=isucon-lab）")
+    p.add_argument("--lab")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_list)
+
+    p = sp.add_parser("ssh", parents=[sel], help="ssh する（コマンドを付ければ実行だけ）")
+    p.add_argument("cmd", nargs="*", help="-- の後ろに実行するコマンド")
+    p.set_defaults(fn=cmd_ssh)
+
+    p = sp.add_parser("push", parents=[sel], help="作業木を送る（rsync。.git・.env・鍵・.cache・target は送らない）")
+    p.add_argument("dir")
+    p.add_argument("--dest", help="送り先（ホームからの相対。既定 work/<ディレクトリ名>）")
+    p.add_argument("--delete", action="store_true", help="送り先にだけあるファイルを消す")
+    p.add_argument("--exclude", action="append", help="除外を足す（繰り返せる）")
+    p.set_defaults(fn=cmd_push)
+
+    p = sp.add_parser("run", parents=[sel], help="台でコマンドを実行する")
+    p.add_argument("--dir", help="実行前に cd する先（push の送り先など）")
+    p.add_argument("cmd", nargs="*", help="-- の後ろに実行するコマンド（1 つなら shell の文字列として渡す）")
+    p.set_defaults(fn=cmd_run)
+
+    p = sp.add_parser("fetch", parents=[sel], help="台のファイルを持ち帰る（rsync）")
+    p.add_argument("remote", help="台のパス（ホームからの相対でよい）")
+    p.add_argument("--to", help="持ち帰り先（既定 <state>/<lab>/fetch。台ごとに node<N>/）")
+    p.set_defaults(fn=cmd_fetch)
+
+    p = sp.add_parser("cpuinfo", parents=[sel], help="各台の /proc/cpuinfo を持ち帰る（cpu-features の入力）")
+    p.add_argument("--to")
+    p.set_defaults(fn=cmd_cpuinfo)
+
+    p = sp.add_parser("down", parents=[common], help="実験室の台を終了する（変更系）")
+    p.add_argument("--lab")
+    p.add_argument("--all", action="store_true", help="タグ purpose=isucon-lab の全部")
+    p.set_defaults(fn=cmd_down)
+
+    p = sp.add_parser("sweep", parents=[common], help="期限（ttl）を過ぎた残りを終了する（変更系）")
+    p.add_argument("--grace", type=int, default=10, help="期限からの猶予（分）。既定 10")
+    p.set_defaults(fn=cmd_sweep)
+
+    p = sp.add_parser("price", parents=[common], help="時間単価を調べる（読み取りだけ）")
+    p.add_argument("--type", required=True)
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--hours", type=float, default=2.0)
+    p.set_defaults(fn=cmd_price)
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None, env: Optional[Dict[str, str]] = None, cwd: Optional[Path] = None,
+         runner: Runner = default_runner, out: Optional[Callable[[str], None]] = None,
+         err: Optional[Callable[[str], None]] = None, now: Callable[[], float] = time.time) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `--` の後ろ（run / ssh のコマンド）は argparse に解釈させない
+    tail: List[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, tail = argv[:i], argv[i + 1:]
+    ap = build_parser()
+    a = ap.parse_args(argv)
+    if tail:
+        if not hasattr(a, "cmd"):
+            ap.error("-- は ssh / run だけで使う")
+        a.cmd = list(a.cmd or []) + tail
+    try:
+        cfg = Config.load(dict(os.environ if env is None else env), cwd or Path.cwd())
+        if a.profile:
+            cfg.profile = a.profile
+        if a.region:
+            cfg.region = a.region
+        ctx = Ctx(cfg, getattr(a, "dry_run", False), runner, out or (lambda s: print(s)), err or (lambda s: print(s, file=sys.stderr)), now)
+        return a.fn(ctx, a)
+    except LabError as e:
+        (err or (lambda s: print(s, file=sys.stderr)))("lab-aws: %s" % e)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,5 @@
+# URI をまとめる正規表現（alp-groups.txt と同じ形。# から行末はコメント）
+^/api/lists/[0-9]+$
+^/api/items/[0-9]+$
+^/api/items/[0-9]+/notes$
+^/api/files/[0-9]+$

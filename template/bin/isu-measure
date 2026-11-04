@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# isu-measure start|wait|stop <id> — ベンチ1回分の計測。通常は bin/isu-bench から呼ばれる。
+#   start: ログを空にし、slow log を ON、各ホストで vmstat/pidstat、アプリホストで perf record を開始
+#   wait : nginx のアクセスログの流量でベンチの開始と終了を検知して戻る（ポータルで押す運用向け）
+#   stop : 収集を止め、サーバ上で alp / pt-query-digest / perf report を作り、results/<id>/ に回収して要約
+. "$(dirname "$0")/lib.sh"
+cmd=${1:?usage: isu-measure start|wait|stop <id>}; id=${2:?id}
+R="$ISU_RESULTS/$id"; mkdir -p "$R"
+meta() { echo "$1=$(printf %q "$2")" >> "$R/meta.env"; }
+
+role_flags() { # $1=host -> "app nginx db" のうち該当するもの
+  local f=""
+  in_list "$1" $ISU_APP_HOSTS && f="$f app"
+  [ "$1" = "$ISU_NGINX_HOST" ] && f="$f nginx"
+  [ "$1" = "$ISU_DB_HOST" ] && f="$f db"
+  echo "$f"
+}
+
+case "$cmd" in
+start)
+  for h in $ISU_HOSTS; do
+    [ -n "$(isu_ip "$h")" ] || continue
+    isu_sh "$h" "$(role_flags "$h")" "$ISU_ACCESS_LOG" "$ISU_SLOW_LOG" <<'EOS'
+set -u
+roles=$1 LOG=$2 SLOW=$3 M=/tmp/isu-m
+has() { case " $roles " in *" $1 "*) return 0;; esac; return 1; }
+pkill -f 'vmstat -n -t 1' 2>/dev/null; pkill -f 'pidstat -u -h 1' 2>/dev/null
+sudo pkill -INT -f 'perf record -F 99' 2>/dev/null; sleep 0.5
+sudo rm -rf $M; mkdir -p $M; date +%s > $M/t_start
+export LC_ALL=C S_TIME_FORMAT=ISO
+nohup timeout 1800 stdbuf -oL vmstat -n -t 1 > $M/vmstat.log 2>&1 < /dev/null &
+nohup timeout 1800 stdbuf -oL pidstat -u -h 1 > $M/pidstat.log 2>&1 < /dev/null &
+if has app && command -v perf >/dev/null; then
+  sudo sysctl -qw kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+  nohup sudo timeout -s INT 1800 perf record -F 99 -a -g -o $M/perf.data > $M/perf.out 2>&1 < /dev/null &
+fi
+has nginx && sudo truncate -s0 "$LOG"
+if has db; then sudo truncate -s0 "$SLOW"; sudo mysql -e 'SET GLOBAL slow_query_log=ON'; fi
+true
+EOS
+  done
+  ok "measure start ($id)" ;;
+
+wait)
+  # アクセスログの行数を毎秒見て、ISU_IDLE_RPS を超えたら開始、下回る状態が ISU_IDLE_SECS 続いたら終了
+  isu_wait_mark "ベンチ実行待ち（ポータルで実行） #$id"
+  log "ベンチの開始を待っています（ポータルで実行してください）…"
+  isu_sh "$ISU_NGINX_HOST" "$ISU_ACCESS_LOG" "$ISU_IDLE_RPS" "$ISU_IDLE_SECS" <<'EOS' | while read -r ev ep hms; do
+LOG=$1 RPS=$2 IDLE=$3
+lines() { sudo wc -l "$LOG" 2>/dev/null | cut -d" " -f1; }
+prev=$(lines); [ -n "$prev" ] || { echo "ERROR 0 0"; exit 0; }; started=0; quiet=0; waited=0
+while :; do
+  sleep 1; cur=$(lines); [ -n "$cur" ] || { echo "ERROR 0 0"; exit 0; }; d=$((cur - prev)); prev=$cur
+  [ $d -lt 0 ] && d=$cur   # ローテート/truncate された
+  if [ $started = 0 ]; then
+    waited=$((waited + 1)); [ $waited -gt 1800 ] && { echo "TIMEOUT 0 0"; exit 0; }
+    [ $d -gt "$RPS" ] && { started=1; echo "START $(( $(date +%s) - 1 )) $(date -d @$(( $(date +%s) - 1 )) +%T)"; }
+  else
+    if [ $d -lt "$RPS" ]; then quiet=$((quiet + 1)); else quiet=0; fi
+    [ $quiet -ge "$IDLE" ] && { echo "END $(( $(date +%s) - IDLE )) $(date -d @$(( $(date +%s) - IDLE )) +%T)"; exit 0; }
+  fi
+done
+EOS
+    case "$ev" in
+      START) meta START "$ep"; meta START_HMS "$hms"; log "ベンチ開始を検知 ($hms)"
+             isu_wait_mark "ベンチ実行中 #$id"
+             if [ -n "$ISU_PPROF_URL" ]; then for h in $ISU_APP_HOSTS; do
+               isu_ssh "$h" "nohup curl -s -o /tmp/isu-m/cpu.pprof '$ISU_PPROF_URL?seconds=${ISU_PPROF_SECONDS:-60}' >/dev/null 2>&1 < /dev/null &"
+             done; fi ;;
+      END) meta END "$ep"; meta END_HMS "$hms"; log "ベンチ終了を検知 ($hms)" ;;
+      TIMEOUT) warn "30分待ってもベンチが始まりませんでした" ;;
+      ERROR) warn "アクセスログを読めません: $ISU_ACCESS_LOG" ;;
+    esac
+  done
+  isu_wait_clear ;;
+
+stop)
+  groups=""; [ -f "$ISU_ROOT/conf/alp-groups.txt" ] && groups=$(grep -vE '^[[:space:]]*(#|$)' "$ISU_ROOT/conf/alp-groups.txt" | paste -sd, -)
+  for h in $ISU_HOSTS; do
+    [ -n "$(isu_ip "$h")" ] || continue
+    mkdir -p "$R/$h"
+    isu_sh "$h" "$(role_flags "$h")" "$ISU_ACCESS_LOG" "$ISU_SLOW_LOG" "$groups" "$(isu_services "$h")" <<'EOS' | tar -xzf - -C "$R/$h"
+set -u
+roles=$1 LOG=$2 SLOW=$3 GROUPS=$4 SERVICES=$5 M=/tmp/isu-m
+has() { case " $roles " in *" $1 "*) return 0;; esac; return 1; }
+{
+pkill -f 'vmstat -n -t 1'; pkill -f 'pidstat -u -h 1'
+if pgrep -f 'perf record -F 99' >/dev/null; then
+  sudo pkill -INT -f 'perf record -F 99'
+  for _ in $(seq 60); do pgrep -f 'perf record -F 99' >/dev/null || break; sleep 0.5; done
+fi
+if has db; then
+  sudo mysql -e 'SET GLOBAL slow_query_log=OFF'
+  sudo pt-query-digest --limit 30 "$SLOW" > $M/slow.txt 2>/dev/null
+fi
+if has nginx; then
+  sudo alp json --file "$LOG" --sort sum -r -o count,1xx,2xx,3xx,4xx,5xx,method,uri,min,avg,max,sum,p99 \
+    ${GROUPS:+-m "$GROUPS"} > $M/alp.txt 2>&1
+  sudo alp json --file "$LOG" --sort count -r -o count,method,uri,4xx,5xx ${GROUPS:+-m "$GROUPS"} \
+    -f 'Status >= 400' > $M/alp-errors.txt 2>&1
+  # 山の窓の要約（tools/bench-window）のために生のログも持ち帰る。git には入れない（.gitignore）
+  sudo cp "$LOG" $M/access.log && sudo chmod a+r $M/access.log
+fi
+if has app; then
+  if [ -f $M/perf.data ]; then
+    sudo perf report -i $M/perf.data --stdio --no-children -g none --sort comm,dso,sym --percent-limit 0.3 2>/dev/null \
+      | grep -v '^#' | grep -v '^$' | grep -v ' swapper ' | head -100 > $M/perf.txt
+  fi
+  if [ -n "$SERVICES" ]; then
+    u=""; for s in $SERVICES; do u="$u -u $s"; done
+    sudo journalctl $u --since @"$(cat $M/t_start)" --no-pager -o short-iso > $M/journal-all.txt 2>&1
+    # 同じメッセージを数えて多い順に（時刻・PID・ID っぽい英数字列は潰して集約する）
+    { echo "total lines: $(wc -l < $M/journal-all.txt)"
+      grep -iE 'error|panic|fatal|warn|fail|timeout|refused' $M/journal-all.txt \
+        | cut -d' ' -f3- | sed -E 's/\[[0-9]+\]//; s/[0-9]{4}\/[0-9]{2}\/[0-9]{2} [0-9:.]+//; s/[0-9A-Z]{20,}/<id>/g' \
+        | sort | uniq -c | sort -nr | head -40; } > $M/journal.txt
+    rm -f $M/journal-all.txt
+  fi
+fi
+} > /dev/null 2>&1
+cd $M && tar -czf - --exclude=perf.data --exclude=perf.out .
+EOS
+  done
+  "$ISU_ROOT/bin/isu-summarize" "$id"
+  ok "results/$id/SUMMARY.md" ;;
+*) die "usage: isu-measure start|wait|stop <id>" ;;
+esac

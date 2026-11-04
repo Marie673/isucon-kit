@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# isu-keys — 初回だけ。EC2 のキーペア（ISU_BOOT_USER/ISU_BOOT_KEY）で入り、
+# isucon ユーザーの authorized_keys に「自分の鍵」と「チーム全員の GitHub 公開鍵」を入れる。
+. "$(dirname "$0")/lib.sh"
+
+[ -f "$ISU_SSH_KEY" ] || ssh-keygen -t ed25519 -N "" -C "isucon@$(hostname -s)" -f "$ISU_SSH_KEY" -q
+keys=$(cat "$ISU_SSH_KEY.pub")
+for u in $ISU_TEAM_GITHUB; do
+  k=$(curl -fsSL "https://github.com/$u.keys") || die "GitHub の鍵を取得できません: $u"
+  keys="$keys"$'\n'"$k"
+done
+
+for h in $ISU_HOSTS; do
+  ip=$(isu_ip "$h"); [ -n "$ip" ] || { warn "$h: IP 未設定のためスキップ"; continue; }
+  # まず isucon で入れるなら何もしない
+  if isu_ssh "$h" -o BatchMode=yes true 2>/dev/null; then ok "$h: isucon で接続済み"; continue; fi
+  log "$h: $ISU_BOOT_USER@$ip で鍵を配布"
+  printf '%s\n' "$keys" | ssh -i "$ISU_BOOT_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile="$ISU_STATE/known_hosts" "$ISU_BOOT_USER@$ip" \
+    'sudo install -d -m 700 -o isucon -g isucon /home/isucon/.ssh &&
+     sudo touch /home/isucon/.ssh/authorized_keys &&
+     while IFS= read -r k; do [ -n "$k" ] && { sudo grep -qxF "$k" /home/isucon/.ssh/authorized_keys || echo "$k" | sudo tee -a /home/isucon/.ssh/authorized_keys >/dev/null; }; done &&
+     sudo chown isucon:isucon /home/isucon/.ssh/authorized_keys && sudo chmod 600 /home/isucon/.ssh/authorized_keys'
+  isu_ssh "$h" -o BatchMode=yes true && ok "$h: isucon で接続できました"
+done

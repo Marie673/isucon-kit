@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# isu-setup — 全ホストに計測基盤を入れる（初回に1回。何度流しても同じ結果になる）
+#   - alp / pt-query-digest / sysstat / perf
+#   - nginx: alp 用 JSON ログ形式（conf.d/isu-log.conf）。nginx.conf 側の access_log は無効化
+#   - MySQL: long_query_time=0 を設定しておき、slow_query_log は計測中だけ ON にする
+#     （long_query_time はセッション単位なので、接続プールの既存接続にも効くよう my.cnf で入れる）
+# サーバを直接変える唯一の例外。終わったら isu-import で設定を repo に取り込む。
+. "$(dirname "$0")/lib.sh"
+ALP_VERSION=v1.0.22
+
+for h in $ISU_HOSTS; do
+  [ -n "$(isu_ip "$h")" ] || continue
+  log "$h: パッケージと alp を導入"
+  isu_sh "$h" "$ALP_VERSION" <<'EOS'
+set -eu
+ALP_VERSION=$1
+export DEBIAN_FRONTEND=noninteractive
+sudo apt-get update -qq >/dev/null 2>&1
+sudo apt-get install -y -qq sysstat percona-toolkit jq >/dev/null 2>&1 || echo "WARN: apt install に失敗"
+sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 \
+  || sudo apt-get install -y -qq linux-tools-common linux-tools-aws >/dev/null 2>&1 \
+  || sudo apt-get install -y -qq linux-tools-common linux-tools-generic >/dev/null 2>&1 \
+  || echo "WARN: perf を入れられませんでした"
+case $(uname -m) in x86_64) a=amd64;; aarch64) a=arm64;; esac
+if ! command -v alp >/dev/null || ! alp --version 2>&1 | grep -q "${ALP_VERSION#v}"; then
+  curl -fsSL "https://github.com/tkuchiki/alp/releases/download/$ALP_VERSION/alp_linux_$a.tar.gz" | sudo tar -xz -C /usr/local/bin alp
+fi
+echo "ARCH=$a"
+EOS
+done | tee "$ISU_STATE/setup.log" | grep -E '^(ARCH|WARN)' || true
+
+arch=$(awk -F= '/^ARCH=/{print $2; exit}' "$ISU_STATE/setup.log")
+if [ -n "$arch" ] && [ "$arch" != "$ISU_ARCH" ]; then
+  sed -i '' -e "s/^ISU_ARCH=.*/ISU_ARCH=$arch               # isu-setup が検出/" "$ISU_ENV_FILE"
+  ok "ISU_ARCH=$arch に更新しました（isu.env）"
+fi
+
+if [ -n "$ISU_NGINX_HOST" ]; then
+  log "$ISU_NGINX_HOST: nginx を alp 用 JSON ログにする"
+  isu_sh "$ISU_NGINX_HOST" "$ISU_ACCESS_LOG" <<'EOS'
+set -eu
+LOG=$1
+sudo tee /etc/nginx/conf.d/isu-log.conf >/dev/null <<EOF
+# isu-setup: alp 用ログ。終盤は access_log off; にする（isu-logs off）
+log_format isu_json escape=json '{"time":"\$time_iso8601","host":"\$remote_addr","method":"\$request_method","uri":"\$request_uri","status":"\$status","body_bytes":\$body_bytes_sent,"request_time":"\$request_time","response_time":"\$request_time","upstream_time":"\$upstream_response_time","ua":"\$http_user_agent"}';
+access_log $LOG isu_json;
+EOF
+# 既存の access_log 指定は二重記録になるので無効化（isu-log.conf 以外）
+for f in /etc/nginx/nginx.conf /etc/nginx/sites-enabled/*; do
+  [ -f "$f" ] || continue
+  sudo sed -i -E 's/^([[:space:]]*)(access_log[[:space:]])/\1# isu-setup: \2/' "$f"
+done
+sudo nginx -t 2>&1 | tail -1
+sudo systemctl reload nginx
+EOS
+fi
+
+if [ -n "$ISU_DB_HOST" ]; then
+  log "$ISU_DB_HOST: MySQL の slow log を準備（long_query_time=0, 既定は OFF）"
+  isu_sh "$ISU_DB_HOST" "$ISU_SLOW_LOG" <<'EOS'
+set -eu
+SLOW=$1
+dir=/etc/mysql/mysql.conf.d; [ -d $dir ] || dir=/etc/mysql/mariadb.conf.d; [ -d $dir ] || dir=/etc/mysql/conf.d
+sudo tee $dir/zz-isu.cnf >/dev/null <<EOF
+# isu-setup: 計測中だけ SET GLOBAL slow_query_log=ON にする（bin/isu-measure）
+[mysqld]
+long_query_time = 0
+slow_query_log = 0
+slow_query_log_file = $SLOW
+EOF
+sudo install -d -o mysql -g adm "$(dirname "$SLOW")"
+sudo touch "$SLOW"; sudo chown mysql:adm "$SLOW"
+sudo systemctl restart mysql 2>/dev/null || sudo systemctl restart mariadb
+sudo mysql -NBe "select @@long_query_time, @@slow_query_log_file"
+EOS
+fi
+
+# MySQL を再起動したのでアプリも再起動しておく
+for h in $ISU_HOSTS; do
+  s=$(isu_services "$h"); [ -n "$s" ] || continue
+  isu_ssh "$h" "sudo systemctl restart $s"
+done
+ok "setup 完了。次は bin/isu-import で設定とコードを repo に取り込む"

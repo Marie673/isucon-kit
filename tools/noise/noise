@@ -1,0 +1,420 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""noise: スコアのぶれの幅を出し、2 群の差がぶれの中かどうかを判定する。
+
+同じ commit でも点は ±10% ぶれる。1 本ずつ比べて設定を切り替えると、ぶれを改善・悪化と取り違える。
+同じ条件を数本流して「ぶれの幅」を知り、差がそれより大きいときだけ良い・悪いと言う。
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import sys
+from typing import NamedTuple
+
+EXIT_SAME, EXIT_BETTER, EXIT_WORSE, EXIT_FEW = 0, 10, 11, 12  # 使い方の誤りは argparse の 2、読めない入力は 1
+
+KEY_ALIASES = {
+    "id": ("id", "run", "bench_id"),
+    "commit": ("commit", "sha", "rev"),
+    "score": ("score", "points"),
+    "pass": ("pass", "passed", "result"),
+    "label": ("label", "name", "condition", "tag"),
+    "note": ("note", "memo"),
+}
+TRUE_WORDS = {"1", "true", "yes", "y", "ok", "pass", "passed", "success", "成功", "通過"}
+FALSE_WORDS = {"0", "false", "no", "n", "fail", "failed", "ng", "error", "失格", "失敗"}
+
+
+class Row(NamedTuple):
+    id: str
+    commit: str
+    score: float | None  # 未記録（`?` や空）は None
+    passed: bool
+    label: str
+    note: str
+
+
+# ---------------------------------------------------------------- 入力
+
+def split_md_row(line: str) -> list[str]:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+
+def clean_cell(s: str) -> str:
+    s = s.strip()
+    m = re.fullmatch(r"\[([^\]]*)\]\([^)]*\)", s)  # [id](id/SUMMARY.md)
+    if m:
+        s = m.group(1)
+    return s.strip("`").strip()
+
+
+def parse_score(s: str) -> float | None:
+    s = str(s).strip().replace(",", "")
+    if s in ("", "?", "-", "null", "None"):
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def parse_pass(s) -> bool:
+    if isinstance(s, bool):
+        return s
+    t = str(s).strip().lower()
+    if t in FALSE_WORDS:
+        return False
+    return True  # 空・未知は通ったものとして扱う
+
+
+def normalize(d: dict[str, object]) -> dict[str, str]:
+    low = {str(k).strip().lower(): ("" if v is None else str(v)) for k, v in d.items() if k is not None}
+    out = {}
+    for key, aliases in KEY_ALIASES.items():
+        for a in aliases:
+            if a in low:
+                out[key] = clean_cell(low[a])
+                break
+    if "pass" in out and isinstance(d.get("pass"), bool):  # JSON の true/false
+        out["pass"] = "true" if d["pass"] else "false"
+    return out
+
+
+def rows_from_dicts(dicts: list[dict[str, object]]) -> list[Row]:
+    rows = []
+    for d in dicts:
+        n = normalize(d)
+        rows.append(Row(n.get("id", ""), n.get("commit", ""), parse_score(n.get("score", "")),
+                        parse_pass(n.get("pass", "")), n.get("label", ""), n.get("note", "")))
+    return rows
+
+
+def load_rows(path: str) -> list[Row]:
+    if path == "-":
+        text = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    if lines[0].lstrip().startswith("{"):
+        dicts = []
+        for ln in lines:
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                dicts.append(d)
+        return rows_from_dicts(dicts)
+    if any(re.match(r"\s*\|.*\bscore\b", ln, re.I) for ln in lines):  # bin/isu-score の SCOREBOARD.md など
+        header: list[str] | None = None
+        dicts = []
+        for ln in lines:
+            if not ln.lstrip().startswith("|"):
+                continue
+            cells = split_md_row(ln)
+            if header is None:
+                if any(c.lower() == "score" for c in cells):
+                    header = cells
+                continue
+            if all(re.fullmatch(r":?-{3,}:?", c) or c == "" for c in cells):
+                continue
+            dicts.append(dict(zip(header, cells)))
+        return rows_from_dicts(dicts)
+    return rows_from_dicts(list(csv.DictReader(lines)))
+
+
+def apply_label_from_note(rows: list[Row], pattern: str | None) -> list[Row]:
+    if not pattern:
+        return rows
+    rx = re.compile(pattern)
+    out = []
+    for r in rows:
+        label = r.label
+        if not label and r.note:
+            m = rx.search(r.note)
+            if m:
+                label = (m.group(1) if m.groups() and m.group(1) is not None else m.group(0)).strip()
+        out.append(r._replace(label=label))
+    return out
+
+
+# ---------------------------------------------------------------- 選択
+
+def resolve_ids(rows: list[Row], spec: str) -> set[int]:
+    """`a+b+c` や `a..b`（ファイル順の範囲、両端を含む）を行の位置の集合にする。"""
+    pos = {r.id: i for i, r in enumerate(rows) if r.id}
+    picked: set[int] = set()
+
+    def at(i: str) -> int:
+        if i not in pos:
+            raise ValueError(f"id {i!r} が入力に無い")
+        return pos[i]
+
+    for tok in filter(None, (t.strip() for t in spec.split("+"))):
+        if ".." in tok:
+            a, b = tok.split("..", 1)
+            lo, hi = sorted((at(a), at(b)))
+            picked.update(range(lo, hi + 1))
+        else:
+            picked.add(at(tok))
+    return picked
+
+
+def select(rows: list[Row], sel: str, include_failed: bool = False):
+    """セレクタ（`label=NAME` `commit=SHA` `ids=A+B` `A..B` を `,` で AND、素の語は label→commit の順）で行を絞る。
+    返り値: (使う行, 失格で除いた数, 未記録で除いた数)"""
+    keep = list(range(len(rows)))
+    for part in filter(None, (p.strip() for p in sel.split(","))):
+        key, eq, val = part.partition("=")
+        if not eq:
+            key, val = ("label", part) if any(r.label == part for r in rows) else ("commit", part)
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "label":
+            keep = [i for i in keep if rows[i].label == val]
+        elif key == "commit":
+            keep = [i for i in keep if rows[i].commit and (rows[i].commit.startswith(val) or val.startswith(rows[i].commit))]
+        elif key in ("ids", "id"):
+            ids = resolve_ids(rows, val)
+            keep = [i for i in keep if i in ids]
+        else:
+            raise ValueError(f"セレクタのキーが分からない: {key!r}（label / commit / ids）")
+    chosen = [rows[i] for i in keep]
+    unrecorded = sum(1 for r in chosen if r.score is None)
+    chosen = [r for r in chosen if r.score is not None]
+    failed = sum(1 for r in chosen if not r.passed)
+    if not include_failed:
+        chosen = [r for r in chosen if r.passed]
+    return chosen, failed, unrecorded
+
+
+# ---------------------------------------------------------------- 統計
+
+class Stats(NamedTuple):
+    n: int
+    mean: float
+    sd: float | None  # 標本標準偏差。n < 2 は None
+    lo: float
+    hi: float
+
+    @property
+    def span(self) -> float:
+        return self.hi - self.lo
+
+    @property
+    def cv(self) -> float | None:
+        return (self.sd / self.mean) if (self.sd is not None and self.mean) else None
+
+
+def stats_of(vals: list[float]) -> Stats | None:
+    if not vals:
+        return None
+    n = len(vals)
+    mean = sum(vals) / n
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1)) if n >= 2 else None
+    return Stats(n, mean, sd, min(vals), max(vals))
+
+
+def fnum(x: float | None, vals_int: bool = True) -> str:
+    if x is None:
+        return "-"
+    if vals_int:
+        return f"{x:,.0f}"
+    return f"{x:,.2f}"
+
+
+def pct(x: float | None) -> str:
+    return "-" if x is None else f"{x * 100:.1f}%"
+
+
+def md_table(headers: list[str], rows: list[list[str]], right_from: int = 1) -> str:
+    al = ["---" if i < right_from else "---:" for i in range(len(headers))]
+    return "\n".join(["| " + " | ".join(headers) + " |", "| " + " | ".join(al) + " |"] + ["| " + " | ".join(r) + " |" for r in rows])
+
+
+def all_int(vals: list[float]) -> bool:
+    return all(float(v).is_integer() for v in vals)
+
+
+# ---------------------------------------------------------------- コマンド
+
+def cmd_band(args, rows: list[Row]) -> int:
+    sel = ",".join(x for x in (f"label={args.label}" if args.label else "", f"commit={args.commit}" if args.commit else "",
+                               f"ids={args.ids}" if args.ids else "") if x)
+    out = ["# noise band" + (f": {sel}" if sel else "（ラベルごと）"), ""]
+    if sel:
+        chosen, failed, unrec = select(rows, sel, args.include_failed)
+        s = stats_of([r.score for r in chosen])
+        if s is None:
+            print(f"該当する行が無い（{sel}）。失格 {failed} 本、未記録 {unrec} 本は除く。", file=sys.stderr)
+            return 1
+        vi = all_int([r.score for r in chosen])
+        out.append(md_table(
+            ["本数", "平均", "標準偏差", "最小", "最大", "幅（最大−最小）", "変動係数", "平均 ± 2σ"],
+            [[str(s.n), fnum(s.mean, vi), fnum(s.sd, False) if s.sd is not None else "-", fnum(s.lo, vi), fnum(s.hi, vi),
+              fnum(s.span, vi), pct(s.cv),
+              "-" if s.sd is None else f"{fnum(s.mean - 2 * s.sd, vi)} 〜 {fnum(s.mean + 2 * s.sd, vi)}"]]))
+        out += ["", md_table(["id", "commit", "label", "score"],
+                             [[r.id or "-", r.commit or "-", r.label or "-", fnum(r.score, vi)] for r in chosen], right_from=3)]
+        notes = []
+        if failed:
+            notes.append(f"失格（pass でない）{failed} 本は{'含めた' if args.include_failed else '除いた'}")
+        if unrec:
+            notes.append(f"点が未記録の {unrec} 行は除いた")
+        if s.n < 2:
+            notes.append("本数不足: 1 本ではぶれの幅が分からない。同じ条件であと 2 本以上流す")
+        elif s.n < 3:
+            notes.append("2 本だけでは幅が不安定。あと 1 本以上流すと信頼できる")
+        if notes:
+            out += [""] + [f"- {n}" for n in notes]
+    else:
+        labels: list[str] = []
+        for r in rows:
+            if r.label not in labels:
+                labels.append(r.label)
+        table = []
+        for lab in labels:
+            chosen, failed, unrec = select(rows, f"label={lab}", args.include_failed)
+            s = stats_of([r.score for r in chosen])
+            vi = all_int([r.score for r in chosen]) if chosen else True
+            if s is None:
+                table.append([lab or "（なし）", "0", "-", "-", "-", "-", "-", str(failed), str(unrec)])
+                continue
+            table.append([lab or "（なし）", str(s.n), fnum(s.mean, vi), fnum(s.sd, False) if s.sd is not None else "-",
+                          f"{fnum(s.lo, vi)}〜{fnum(s.hi, vi)}", fnum(s.span, vi), pct(s.cv), str(failed), str(unrec)])
+        out.append(md_table(["label", "本数", "平均", "標準偏差", "最小〜最大", "幅", "変動係数", "失格", "未記録"], table))
+    sys.stdout.write("\n".join(out) + "\n")
+    return 0
+
+
+def cmd_compare(args, rows: list[Row]) -> int:
+    ca, fa, ua = select(rows, args.a, args.include_failed)
+    cb, fb, ub = select(rows, args.b, args.include_failed)
+    sa, sb = stats_of([r.score for r in ca]), stats_of([r.score for r in cb])
+    vi = all_int([r.score for r in ca + cb]) if (ca or cb) else True
+    out = [f"# noise compare: A = {args.a} / B = {args.b}", ""]
+    table = []
+    for name, sel, s, f, u in (("A", args.a, sa, fa, ua), ("B", args.b, sb, fb, ub)):
+        if s is None:
+            table.append([name, sel, "0", "-", "-", "-", "-", "-"])
+        else:
+            table.append([name, sel, str(s.n), fnum(s.mean, vi), fnum(s.sd, False) if s.sd is not None else "-",
+                          f"{fnum(s.lo, vi)}〜{fnum(s.hi, vi)}", fnum(s.span, vi), pct(s.cv)])
+    out.append(md_table(["群", "セレクタ", "本数", "平均", "標準偏差", "最小〜最大", "幅", "変動係数"], table, right_from=2))
+    out.append("")
+    if sa is None or sb is None or sa.n < args.min_n or sb.n < args.min_n:
+        verdict, code = "本数不足", EXIT_FEW
+        small = [f"{n} が {s.n if s else 0} 本" for n, s in (("A", sa), ("B", sb)) if s is None or s.n < args.min_n]
+        out.append(f"**判定: {verdict}**（{'、'.join(small)}。各群 {args.min_n} 本以上が要る。同じ条件であと何本か流す）")
+    else:
+        k = args.k
+        sdA, sdB = sa.sd or 0.0, sb.sd or 0.0
+        width = max(k * sdA, k * sdB, sa.span, sb.span)
+        diff = sb.mean - sa.mean
+        base = f"{k:g}σ（A {k * sdA:,.1f}、B {k * sdB:,.1f}）と範囲（A {fnum(sa.span, vi)}、B {fnum(sb.span, vi)}）の最大"
+        if abs(diff) <= width:
+            verdict, code = "差なし", EXIT_SAME
+        else:
+            good = (diff > 0) != args.lower_is_better
+            verdict, code = ("良い", EXIT_BETTER) if good else ("悪い", EXIT_WORSE)
+        rel = (diff / sa.mean) if sa.mean else None
+        out.append(md_table(
+            ["平均の差（B − A）", "差の割合", "ぶれの幅", "差 ÷ 幅"],
+            [[f"{diff:+,.1f}", "-" if rel is None else f"{rel * 100:+.1f}%", f"{width:,.1f}",
+              f"{abs(diff) / width:.2f}" if width else "∞"]],
+            right_from=0))
+        out += ["", f"ぶれの幅 = {base}。", ""]
+        out.append(f"**判定: {verdict}**" + {
+            "差なし": "（平均の差がぶれの幅以内。この差は同じ条件でも出る）",
+            "良い": "（平均の差がぶれの幅を超え、B のほうがよい向き）",
+            "悪い": "（平均の差がぶれの幅を超え、B のほうが悪い向き）",
+        }[verdict])
+        if min(sa.n, sb.n) < 3:
+            out += ["", "- 注意: 2 本の群がある。標準偏差が不安定なので、幅は目安。可能なら 3 本以上"]
+    notes = []
+    for n, f, u in (("A", fa, ua), ("B", fb, ub)):
+        parts = []
+        if f:
+            parts.append(f"失格（pass でない）{f} 本は{'含めた' if args.include_failed else '除いた'}")
+        if u:
+            parts.append(f"点が未記録の {u} 行は除いた")
+        if parts:
+            notes.append(f"- {n}: " + "、".join(parts))
+    if notes:
+        out += [""] + notes
+    sys.stdout.write("\n".join(out) + "\n")
+    return code
+
+
+def build_parser() -> argparse.ArgumentParser:
+    S = argparse.SUPPRESS  # サブコマンドの後ろにも書けるように、共通の引数は親パーサーで持つ
+
+    def make_common() -> argparse.ArgumentParser:  # parents は action を共有するので、親ごとに作る（set_defaults が混ざる）
+        c = argparse.ArgumentParser(add_help=False)
+        c.add_argument("--file", "-f", default=S, metavar="PATH",
+                       help="スコアの記録。CSV・JSONL・bin/isu-score の SCOREBOARD.md（中身で判別）。- は標準入力。既定は scores.csv（$NOISE_FILE）")
+        c.add_argument("--label-from-note", default=S, metavar="REGEX",
+                       help="label が空の行に、note 列にこの正規表現が最初に合った部分（グループ 1 があればそれ）を label として付ける。SCOREBOARD.md 用")
+        c.add_argument("--include-failed", action="store_const", const=True, default=S, help="pass でない行も統計に含める（既定は除く）")
+        return c
+
+    p = argparse.ArgumentParser(
+        prog="noise",
+        description="スコアのぶれの幅を出し、2 群の差がぶれの中かを判定する。1 本ずつの比較で判断しないための道具。",
+        epilog=f"compare の終了コード: {EXIT_SAME}=差なし {EXIT_BETTER}=良い {EXIT_WORSE}=悪い {EXIT_FEW}=本数不足。使い方の誤りは 2、入力が読めないときは 1。",
+        parents=[make_common()],
+    )
+    p.set_defaults(file=os.environ.get("NOISE_FILE", "scores.csv"), label_from_note=None, include_failed=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("band", parents=[make_common()], help="同じ条件の n 本から平均・標準偏差・最小最大・変動係数を出す")
+    b.add_argument("--label", help="この label の行")
+    b.add_argument("--commit", help="この commit（前方一致）の行")
+    b.add_argument("--ids", help="id で行を選ぶ。a+b+c、または a..b（ファイル順の範囲）。SCOREBOARD の id 列など")
+    c = sub.add_parser("compare", parents=[make_common()], help="2 群を比べ、差なし / 良い / 悪い / 本数不足 を返す",
+                       description="A と B はセレクタ。label=NAME、commit=SHA、ids=A+B / ids=A..B、を , で AND にできる。"
+                                   "素の語は label にあればそれ、無ければ commit の前方一致。")
+    c.add_argument("a", metavar="A")
+    c.add_argument("b", metavar="B")
+    c.add_argument("--k", type=float, default=2.0, help="ぶれの幅に使う σ の倍数（既定 2）")
+    c.add_argument("--min-n", type=int, default=2, help="各群の最小本数（既定 2。これ未満は本数不足）")
+    c.add_argument("--lower-is-better", action="store_true", help="小さいほど良い値（レイテンシなど）を比べるとき")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
+    args = p.parse_args(argv)
+    try:
+        rows = apply_label_from_note(load_rows(args.file), args.label_from_note)
+    except (OSError, re.error) as e:
+        print(f"入力を読めない: {e}", file=sys.stderr)
+        return 1
+    if not rows:
+        print(f"{args.file} に行が無い", file=sys.stderr)
+        return 1
+    try:
+        return cmd_band(args, rows) if args.cmd == "band" else cmd_compare(args, rows)
+    except ValueError as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
