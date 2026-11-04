@@ -6,3 +6,6 @@ __pycache__/
 
 # テストの fixtures。利用者のグローバルな *.log の除外に左右されないようにする
 !tools/bench-window/tests/fixtures/*.log
+/tests/latest-test.log
+/tests/tmp*/
+/template/templates/inmemory-rust/target/

@@ -6,6 +6,11 @@
 #     （long_query_time はセッション単位なので、接続プールの既存接続にも効くよう my.cnf で入れる）
 # サーバを直接変える唯一の例外。終わったら isu-import で設定を repo に取り込む。
 . "$(dirname "$0")/lib.sh"
+isu_canonical
+lock_output=$("$ISU_ROOT/bin/isu-lock" acquire setup)
+ISU_LOCK_TOKEN=${lock_output#ISU_LOCK_TOKEN=}
+export ISU_LOCK_TOKEN
+trap '"$ISU_ROOT/bin/isu-lock" release' EXIT
 ALP_VERSION=v1.0.22
 
 for h in $ISU_HOSTS; do
@@ -31,7 +36,12 @@ done | tee "$ISU_STATE/setup.log" | grep -E '^(ARCH|WARN)' || true
 
 arch=$(awk -F= '/^ARCH=/{print $2; exit}' "$ISU_STATE/setup.log")
 if [ -n "$arch" ] && [ "$arch" != "$ISU_ARCH" ]; then
-  sed -i '' -e "s/^ISU_ARCH=.*/ISU_ARCH=$arch               # isu-setup が検出/" "$ISU_ENV_FILE"
+  uv run --no-project python - "$ISU_ENV_FILE" "$arch" <<'PYENV'
+from pathlib import Path
+import re, sys
+p = Path(sys.argv[1])
+p.write_text(re.sub(r'^ISU_ARCH=.*', 'ISU_ARCH=' + sys.argv[2], p.read_text(), flags=re.M))
+PYENV
   ok "ISU_ARCH=$arch に更新しました（isu.env）"
 fi
 
@@ -42,40 +52,21 @@ set -eu
 LOG=$1
 sudo tee /etc/nginx/conf.d/isu-log.conf >/dev/null <<EOF
 # isu-setup: alp 用ログ。終盤は access_log off; にする（isu-logs off）
-log_format isu_json escape=json '{"time":"\$time_iso8601","host":"\$remote_addr","method":"\$request_method","uri":"\$request_uri","status":"\$status","body_bytes":\$body_bytes_sent,"request_time":"\$request_time","response_time":"\$request_time","upstream_time":"\$upstream_response_time","ua":"\$http_user_agent"}';
+log_format isu_json escape=json '{"time":"\$time_iso8601","host":"\$remote_addr","method":"\$request_method","uri":"\$request_uri","status":"\$status","body_bytes":\$body_bytes_sent,"request_time":"\$request_time","response_time":"\$request_time","upstream_time":"\$upstream_response_time","ua":"\$http_user_agent","msec":"\$msec","connection":"\$connection","connection_requests":"\$connection_requests","request_id":"\$request_id","server_protocol":"\$server_protocol","ssl_session_reused":"\$ssl_session_reused","upstream_addr":"\$upstream_addr","auth":"\$http_authorization","cookie":"\$http_cookie"}';
 access_log $LOG isu_json;
 EOF
 # 既存の access_log 指定は二重記録になるので無効化（isu-log.conf 以外）
 for f in /etc/nginx/nginx.conf /etc/nginx/sites-enabled/*; do
   [ -f "$f" ] || continue
-  sudo sed -i -E 's/^([[:space:]]*)(access_log[[:space:]])/\1# isu-setup: \2/' "$f"
+  sudo sed --follow-symlinks -i -E 's/^([[:space:]]*)(access_log[[:space:]])/\1# isu-setup: \2/' "$f"
 done
 sudo nginx -t 2>&1 | tail -1
 sudo systemctl reload nginx
 EOS
 fi
 
-if [ -n "$ISU_DB_HOST" ]; then
-  log "$ISU_DB_HOST: MySQL の slow log を準備（long_query_time=0, 既定は OFF）"
-  isu_sh "$ISU_DB_HOST" "$ISU_SLOW_LOG" <<'EOS'
-set -eu
-SLOW=$1
-dir=/etc/mysql/mysql.conf.d; [ -d $dir ] || dir=/etc/mysql/mariadb.conf.d; [ -d $dir ] || dir=/etc/mysql/conf.d
-sudo tee $dir/zz-isu.cnf >/dev/null <<EOF
-# isu-setup: 計測中だけ SET GLOBAL slow_query_log=ON にする（bin/isu-measure）
-[mysqld]
-long_query_time = 0
-slow_query_log = 0
-slow_query_log_file = $SLOW
-EOF
-sudo install -d -o mysql -g adm "$(dirname "$SLOW")"
-sudo touch "$SLOW"; sudo chown mysql:adm "$SLOW"
-sudo systemctl restart mysql 2>/dev/null || sudo systemctl restart mariadb
-sudo mysql -NBe "select @@long_query_time, @@slow_query_log_file"
-EOS
-fi
+uv run --no-project python "$ISU_ROOT/bin/isu_runtime.py" setup-db
 
-# MySQL を再起動したのでアプリも再起動しておく
 for h in $ISU_HOSTS; do
   s=$(isu_services "$h"); [ -n "$s" ] || continue
   isu_ssh "$h" "sudo systemctl restart $s"

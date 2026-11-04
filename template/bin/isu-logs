@@ -1,15 +1,16 @@
-#!/usr/bin/env bash
-# isu-logs off|on — 終盤（Phase IV）に nginx のアクセスログを止める / 戻す
-#   repo の hosts/<nginx>/etc/nginx/conf.d/isu-log.conf を書き換えるだけ。反映は commit -> isu-deploy。
-#   MySQL の slow log は計測中しか ON にならないので触らなくてよい。
-#   アプリ自身のリクエストログ（echo/chi の logger 等）は別途コードで止めること。
-. "$(dirname "$0")/lib.sh"
-f="$ISU_ROOT/hosts/$ISU_NGINX_HOST/etc/nginx/conf.d/isu-log.conf"
-[ -f "$f" ] || die "$f がありません（isu-setup -> isu-import 済みか確認）"
-case "${1:-}" in
-  off) sed -i '' -E 's/^access_log .*/access_log off;/' "$f" ;;
-  on)  sed -i '' -E "s|^access_log .*|access_log $ISU_ACCESS_LOG isu_json;|" "$f" ;;
-  *) die "usage: isu-logs off|on" ;;
-esac
-grep '^access_log' "$f"
-ok "コミットして bin/isu-deploy で反映してください（off の間は isu-bench の自動検知が効かないので --no-deploy で計測はしない）"
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+from isu_runtime import Kit
+import argparse
+import re
+p = argparse.ArgumentParser()
+p.add_argument('action', choices=['on', 'off'])
+a = p.parse_args(); k = Kit(); k.canonical()
+f = k.root / 'hosts' / k.get('ISU_NGINX_HOST') / 'etc/nginx/conf.d/isu-log.conf'
+value = 'off' if a.action == 'off' else k.get('ISU_ACCESS_LOG') + ' isu_json'
+f.write_text(re.sub(r'^access_log .*;', 'access_log ' + value + ';', f.read_text(), flags=re.M))
+print('変更したパスをコミットして isu-deploy で反映してください。')
+print('off の最終ベンチは start --no-deploy --no-measure を使います。')

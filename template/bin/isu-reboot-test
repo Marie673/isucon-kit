@@ -1,59 +1,8 @@
-#!/usr/bin/env bash
-# isu-reboot-test --yes — 追試シミュレーション。全台をランダムな順序・間隔で再起動し、復旧を確認する
-#   確認: ssh 復帰 / ISU_SERVICES と nginx・mysql が active / ヘルスチェック
-#         再起動前に動いていたサービスがすべて戻っているか
-#   golden は書き込み系の API を叩いてデータを汚すので、ここでは使わない
-#   ヘルスチェックが通っても壊れていることはある（例: /etc/hosts が作り直されて内部呼び出しが失敗）。
-#   必ずこの後のベンチで確かめること。
-#   この後に bin/isu-bench --no-deploy で「再起動前とスコアが近いこと」「データが残っていること」を見る。
-. "$(dirname "$0")/lib.sh"
-[ "${1:-}" = --yes ] || die "全台を再起動します。よければ --yes を付けて実行してください"
-"$ISU_ROOT/bin/isu-lock" acquire "reboot-test"
-trap 'isu_lock_release >/dev/null 2>&1 || true' EXIT
-
-order=$(isu_hosts | while read -r h; do [ -n "$(isu_ip "$h")" ] && echo "$RANDOM $h"; done | sort -n | cut -d' ' -f2)
-log "再起動順: $(echo $order)"
-# 再起動前に動いていたサービスを控える（再起動後に起きてこないものを見つける）
-for h in $order; do
-  isu_ssh "$h" "systemctl list-units --type=service --state=running --no-legend --plain | awk '{print \$1}' | sort" > "$ISU_STATE/running-$h.before"
-  isu_ssh "$h" "cat /proc/sys/kernel/random/boot_id" > "$ISU_STATE/bootid-$h.before"
-done
-# ロックは再起動で消えないよう ~/.isu-lock（ディスク上）にある
-for h in $order; do
-  isu_ssh "$h" "sudo systemctl reboot" >/dev/null 2>&1 || true
-  ssh -F "$ISU_SSH_CONFIG" -O exit "$h" >/dev/null 2>&1 || true
-  gap=$(( RANDOM % 15 )); log "$h: reboot（次まで ${gap}s）"; sleep "$gap"
-done
-
-for h in $order; do
-  t0=$(date +%s)
-  # boot_id が変わるまで待つ（reboot 直後はまだ古いカーネルに ssh が通ってしまう）
-  until b=$(isu_ssh "$h" -o ConnectTimeout=3 cat /proc/sys/kernel/random/boot_id 2>/dev/null) && [ -n "$b" ] && [ "$b" != "$(cat "$ISU_STATE/bootid-$h.before")" ]; do
-    ssh -F "$ISU_SSH_CONFIG" -O exit "$h" >/dev/null 2>&1 || true
-    [ $(( $(date +%s) - t0 )) -lt 300 ] || die "$h: 5分経っても ssh が戻りません"
-    sleep 5
-  done
-  ok "$h: up ($(( $(date +%s) - t0 ))s)"
-done
-for h in $order; do   # 起動処理の完了を待つ（running / degraded になるまで）
-  log "$h: $(isu_ssh "$h" "timeout 180 systemctl is-system-running --wait" 2>/dev/null || true)"
-done
-
-fail=0
-for h in $order; do
-  svcs="$(isu_services "$h")"
-  [ "$h" = "$ISU_NGINX_HOST" ] && svcs="$svcs nginx"
-  [ -n "$ISU_DB_HOST" ] && [ "$h" = "$ISU_DB_HOST" ] && svcs="$svcs mysql"
-  for s in $svcs; do
-    st=$(isu_ssh "$h" "systemctl is-active $s" || true)
-    if [ "$st" = active ]; then ok "$h $s: active"; else warn "$h $s: $st"; fail=1; fi
-  done
-done
-for h in $order; do
-  isu_ssh "$h" "systemctl list-units --type=service --state=running --no-legend --plain | awk '{print \$1}' | sort" > "$ISU_STATE/running-$h.after"
-  missing=$(comm -23 "$ISU_STATE/running-$h.before" "$ISU_STATE/running-$h.after" | grep -vE '^(user@|session-|getty@|serial-getty@|cloud-|snap)' || true)
-  [ -z "$missing" ] || { warn "$h: 再起動前は動いていて今は動いていないサービス: $(echo $missing)"; fail=1; }
-done
-code=$(isu_ssh "$ISU_NGINX_HOST" "curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve $ISU_TARGET_HOST:443:127.0.0.1 https://$ISU_TARGET_HOST$ISU_HEALTH_PATH" || true)
-case "$code" in 2*|3*) ok "health -> $code" ;; *) warn "health -> $code"; fail=1 ;; esac
-[ $fail = 0 ] && ok "再起動試験 OK。続けて bin/isu-bench --no-deploy でスコア再現を確認" || die "再起動試験で問題あり"
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+from isu_runtime import main
+import sys
+sys.exit(main())

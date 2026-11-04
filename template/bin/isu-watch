@@ -1,11 +1,18 @@
-#!/usr/bin/env bash
-# isu-watch — 全ホストの CPU とロック状態を流し続ける（herdr の monitor ペイン用）。Ctrl-C で終了
-. "$(dirname "$0")/lib.sh"
-trap 'kill 0' EXIT INT
-for h in $ISU_HOSTS; do
-  [ -n "$(isu_ip "$h")" ] || continue
-  isu_ssh "$h" "LC_ALL=C vmstat -n -t 2" | awk -v h="$h" '
-    $1=="r" { for (i=1;i<=NF;i++) c[$i]=i; next }
-    $1 ~ /^[0-9]+$/ { printf "%s %-5s run=%-3s us=%-3s sy=%-3s wa=%-3s idle=%-3s free=%dM\n", $NF, h, $c["r"], $c["us"], $c["sy"], $c["wa"], $c["id"], $c["free"]/1024; fflush() }' &
-done
-while :; do echo "$(date +%T) lock: $(isu_lock_describe)"; sleep 15; done
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+from isu_runtime import Kit
+import sys
+import time
+try:
+    k = Kit()
+    while True:
+        k.guard_time()
+        for h in k.hosts():
+            print(h, k.ssh(h, 'LC_ALL=C vmstat -n -t 1 2').stdout, flush=True)
+        print('lock:', k.owner() or 'free', flush=True)
+        time.sleep(5)
+except (RuntimeError, KeyboardInterrupt) as e:
+    print(str(e), file=sys.stderr)

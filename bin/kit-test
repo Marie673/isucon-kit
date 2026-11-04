@@ -1,0 +1,27 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""全道具と偽 ssh のテスト、shellcheck、Rust のテストを実行する。"""
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parent.parent
+failed = []
+for folder in [root / 'tests', root / 'template/bin/tests', *sorted(root.glob('tools/*/tests'))]:
+    p = subprocess.run(['uv', 'run', '--no-project', 'python', '-m', 'unittest', 'discover', '-s', str(folder)], cwd=root)
+    if p.returncode:
+        failed.append(str(folder.relative_to(root)))
+shells = [str(p) for base in ['bin', 'template/bin', 'setup', 'tools'] for p in (root / base).rglob('*')
+          if p.is_file() and (p.name == 'lib.sh' or p.read_bytes().startswith(b'#!/usr/bin/env bash'))]
+p = subprocess.run(['shellcheck', '--severity=warning', '-e', 'SC1091', *shells], cwd=root)
+if p.returncode:
+    failed.append('shellcheck')
+p = subprocess.run(['cargo', 'test', '--manifest-path', str(root / 'template/templates/inmemory-rust/Cargo.toml')], cwd=root)
+if p.returncode:
+    failed.append('cargo test')
+if failed:
+    print('失敗: ' + ', '.join(failed), file=sys.stderr)
+sys.exit(bool(failed))

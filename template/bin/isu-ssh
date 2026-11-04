@@ -1,6 +1,8 @@
-#!/usr/bin/env bash
-# isu-ssh <host> [command...]  — isu.env の設定で競技サーバに入る（読み取り・計測用。変更は deploy 経由）
-. "$(dirname "$0")/lib.sh"
-[ $# -ge 1 ] || die "usage: isu-ssh <host> [command...]"
-h="$1"; shift
-exec ssh -F "$ISU_SSH_CONFIG" "$h" "$@"
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+from isu_runtime import main
+import sys
+sys.exit(main())

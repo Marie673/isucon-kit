@@ -34,7 +34,7 @@ case "$mode" in
 以下は実装前の設計案です。設計の段階で潰すべき問題を指摘してください。"
     log "plan review by $with"
     case "$with" in
-      codex) printf '%s\n' "$body" | codex exec -s read-only -c model_reasoning_effort=high "$prompt" 2> "$ISU_STATE/review.log" ;;
+      codex) printf '%s\n' "$body" | codex exec -s read-only -c model_reasoning_effort=high "$prompt" 2> >(tee "$ISU_STATE/review.log" >&2) ;;
       claude) printf '%s\n\n<plan>\n%s\n</plan>\n' "$prompt" "$body" | claude -p --allowedTools Read Grep Glob ;;
     esac ;;
   diff)
@@ -42,7 +42,7 @@ case "$mode" in
     git -C "$ISU_ROOT" diff --quiet "$base"...HEAD && die "$base との差分がありません"
     log "diff review ($base...HEAD) by $with"
     case "$with" in
-      codex) (cd "$ISU_ROOT" && codex exec review --base "$base" -c model_reasoning_effort=high "$RUBRIC" 2> "$ISU_STATE/review.log") ;;
+      codex) { printf '%s\n\n' "$RUBRIC"; git -C "$ISU_ROOT" diff "$base"...HEAD; } | (cd "$ISU_ROOT" && codex exec -s read-only -c model_reasoning_effort=high - 2> >(tee "$ISU_STATE/review.log" >&2)) ;;
       claude) { printf '%s\n\n<diff base="%s">\n' "$RUBRIC" "$base"; git -C "$ISU_ROOT" diff "$base"...HEAD; echo '</diff>'; } \
                 | (cd "$ISU_ROOT" && claude -p --allowedTools Read Grep Glob) ;;
     esac ;;

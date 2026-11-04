@@ -1,92 +1,103 @@
-#!/usr/bin/env bash
-# kit-new <repo-dir> [--env <isu.env>] [--with-checkpoint] [--dry-run]
-#   競技用リポジトリを作る。template と tools を展開する。
-#
-#   当日:   bin/kit-new ~/workspace/github.com/<org>/isucon2027
-#   練習:   bin/kit-new /path/to/practice-repo --env /path/to/isu.env
-#
-# - --with-checkpoint: 区切りの hook（tools/checkpoint）と skill audit も入れる。標準では入れない。
-#
-# - AGENTS.md・docs/README.md はキットのもので上書きする。それ以外の既存ファイルは上書きしない。
-# - git add までする。コミットは人間が見てから。
-set -euo pipefail
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""競技用リポジトリを展開する。既存の記録は更新しない。"""
+import argparse
+import json
+from pathlib import Path
+import shutil
+import subprocess
 
-here=$(cd "$(dirname "$0")/.." && pwd)
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 
-[ $# -ge 1 ] || usage
-dst=$1; shift
-env=""; dry=0; checkpoint=0
-while [ $# -gt 0 ]; do
-  case $1 in
-    --env) env=${2:?--env needs a file}; shift 2 ;;
-    --with-checkpoint) checkpoint=1; shift ;;
-    --dry-run) dry=1; shift ;;
-    -h|--help) usage ;;
-    *) echo "unknown option: $1" >&2; usage ;;
-  esac
-done
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('destination', type=Path)
+    p.add_argument('--env', type=Path)
+    p.add_argument('--update', action='store_true')
+    p.add_argument('--no-checkpoint', action='store_true')
+    p.add_argument('--with-checkpoint', action='store_true', help=argparse.SUPPRESS)
+    p.add_argument('--dry-run', action='store_true')
+    a = p.parse_args()
+    here = Path(__file__).resolve().parent.parent
+    dst = a.destination.resolve()
+    expected = set()
+    ownership = dst / ".kit-managed.json"
+    settings_existed = (dst / ".claude/settings.json").exists()
+    previous = set(json.loads(ownership.read_text())) if ownership.exists() else set()
+    def copy(src, rel, update=False):
+        out = dst / rel
+        if update:
+            expected.add(str(rel))
+        if out.exists() and not (a.update and update):
+            return
+        print(('更新: ' if out.exists() else '追加: ') + str(rel))
+        if a.dry_run:
+            return
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if src.suffix == '.md':
+            text = src.read_text().replace('../../template/', '../../')
+            out.write_text(text)
+            shutil.copymode(src, out)
+        else:
+            shutil.copy2(src, out)
+    if not a.dry_run:
+        dst.mkdir(parents=True, exist_ok=True)
+        if not (dst / '.git').exists():
+            subprocess.run(['git', '-C', dst, 'init', '-q', '-b', 'main'], check=True)
+    for src in sorted((here / 'template').rglob('*')):
+        if not src.is_file() or '.DS_Store' in src.parts or 'tests' in src.parts or '__pycache__' in src.parts:
+            continue
+        rel = src.relative_to(here / 'template')
+        managed_file = str(rel) == 'AGENTS.md' or rel.parts[0] in ('bin', '.agents')
+        # Claude の権限も更新する。hook は下で追加する。
+        managed_file |= str(rel) in ('.claude/settings.json', 'CLAUDE.md')
+        copy(src, rel, managed_file)
+    for src in sorted((here / 'tools').rglob('*')):
+        rel = src.relative_to(here)
+        if not src.is_file() or any(x in rel.parts for x in ('tests', '__pycache__', '.DS_Store')):
+            continue
+        if a.no_checkpoint and rel.parts[1] == 'checkpoint':
+            continue
+        copy(src, rel, True)
+    for src in sorted((here / 'docs/tuning').rglob('*')):
+        if src.is_file():
+            copy(src, src.relative_to(here), True)
+    for name in ['strategy.md', 'eval.md']:
+        copy(here / 'docs' / name, Path('docs') / name, True)
+    if not (dst / 'docs/flags.md').exists():
+        copy(here / 'tools/flags/flags.template.md', Path('docs/flags.md'))
+    if a.env:
+        # --env の明示だけが環境の置き換えを許す。
+        if not a.dry_run:
+            shutil.copy2(a.env, dst / 'isu.env')
+    if not a.dry_run:
+        # 記録の雛形は対象にしない。以前このキットが管理したファイルだけを片付ける。
+        if a.update:
+            obsolete = previous - expected
+            # 管理一覧を持たない旧版の廃止した道具も更新する。
+            obsolete.add('bin/isu-task')
+            obsolete.update(str(p.relative_to(dst)) for p in (dst / '.agents/skills/isu-playbook/references').glob('*.md'))
+            for rel in obsolete:
+                out = dst / rel
+                if out.is_file() and not out.is_symlink() and '..' not in Path(rel).parts and not Path(rel).is_absolute():
+                    out.unlink()
+        link = dst / '.claude/skills'
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to('../.agents/skills')
+        if not a.no_checkpoint:
+            copy(here / 'tools/checkpoint/audit/SKILL.md', Path('.agents/skills/audit/SKILL.md'), True)
+        if not a.no_checkpoint and (not settings_existed or a.update):
+            settings = dst / '.claude/settings.json'
+            data = json.loads(settings.read_text())
+            hooks = data.setdefault('hooks', {}).setdefault('PostToolUse', [])
+            if not any('tools/checkpoint/checkpoint' in json.dumps(h) for h in hooks):
+                hooks.append({'matcher': '*', 'hooks': [{'type': 'command', 'command': '"$CLAUDE_PROJECT_DIR"/tools/checkpoint/checkpoint hook'}]})
+            settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+        ownership.write_text(json.dumps(sorted(expected), ensure_ascii=False, indent=2) + '\n')
+    print('展開しました: ' + str(dst))
+    print('次: isu.env → docs/RULES.md → bin/isu-doctor → skill isu-kickoff')
 
-# 上書きするもの（キットが正）
-overwrite="AGENTS.md docs/README.md"
-
-run() { if [ $dry = 1 ]; then echo "+ $*"; else "$@"; fi; }
-
-# 1. リポジトリ
-run mkdir -p "$dst"
-[ -d "$dst/.git" ] || run git -C "$dst" init -q -b main
-
-# 2. template
-(cd "$here/template" && find . -type f ! -name .DS_Store | sed 's|^\./||' | sort) | while read -r f; do
-  if [ -e "$dst/$f" ] && ! printf '%s\n' $overwrite | grep -qx "$f"; then
-    echo "skip（既存）: $f"; continue
-  fi
-  run mkdir -p "$dst/$(dirname "$f")"
-  run cp -p "$here/template/$f" "$dst/$f"
-done
-
-# 3. 道具（tests と fixtures は持ち込まない）
-for t in "$here"/tools/*/; do
-  name=$(basename "$t")
-  [ "$name" = checkpoint ] && [ $checkpoint = 0 ] && continue
-  [ -e "$dst/tools/$name" ] && { echo "skip（既存）: tools/$name"; continue; }
-  run mkdir -p "$dst/tools/$name"
-  (cd "$t" && find . -type f ! -path './tests/*' ! -name .DS_Store | sed 's|^\./||') | while read -r f; do
-    run mkdir -p "$dst/tools/$name/$(dirname "$f")"
-    run cp -p "$t$f" "$dst/tools/$name/$f"
-  done
-done
-
-# 4. フラグの台帳
-if [ ! -e "$dst/docs/flags.md" ] && [ -e "$here/tools/flags/flags.template.md" ]; then
-  run cp "$here/tools/flags/flags.template.md" "$dst/docs/flags.md"
-fi
-
-# 5. isu.env と skill のリンク（Claude Code と Codex で同じ skill を読む: .claude/skills -> ../.agents/skills）
-if [ -n "$env" ]; then run cp "$env" "$dst/isu.env"; fi
-if [ ! -e "$dst/.claude/skills" ]; then
-  run mkdir -p "$dst/.claude"
-  run ln -s ../.agents/skills "$dst/.claude/skills"
-fi
-
-# 6. 区切りの hook と skill audit（--with-checkpoint のときだけ）
-if [ $checkpoint = 1 ]; then
-  run mkdir -p "$dst/.agents/skills/audit"
-  run cp -p "$here/tools/checkpoint/audit/SKILL.md" "$dst/.agents/skills/audit/SKILL.md"
-  hookcmd='"$CLAUDE_PROJECT_DIR"/tools/checkpoint/checkpoint hook'
-  sj="$dst/.claude/settings.json"
-  if [ $dry = 1 ]; then echo "+ hooks.PostToolUse に checkpoint を足す: $sj"
-  elif ! grep -q 'tools/checkpoint/checkpoint' "$sj" 2>/dev/null; then
-    mkdir -p "$dst/.claude"; [ -f "$sj" ] || echo '{}' > "$sj"
-    tmp=$(mktemp)
-    jq --arg c "$hookcmd" '.hooks.PostToolUse = ((.hooks.PostToolUse // []) + [{matcher: "*", hooks: [{type: "command", command: $c}]}])' "$sj" > "$tmp" && mv "$tmp" "$sj"
-  fi
-fi
-
-# 7. タスクボード
-if [ $dry = 0 ]; then
-  if command -v dot >/dev/null && [ ! -d "$dst/.dots" ]; then (cd "$dst" && dot init >/dev/null); fi
-  git -C "$dst" add -A
-fi
-echo "展開しました: $dst"
-echo "次: isu.env を埋める → docs/README.md の作戦ボードから始める（主ループは skill main-loop）"
+if __name__ == '__main__':
+    main()

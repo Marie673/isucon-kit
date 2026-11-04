@@ -21,7 +21,7 @@ for h in $ISU_HOSTS; do
   isu_sh "$h" $(isu_services "$h") <<'EOS' | tar -xzf - -C "$ISU_ROOT/hosts/$h"
 set -eu
 paths=""
-for p in etc/nginx etc/mysql home/isucon/env.sh; do [ -e "/$p" ] && paths="$paths $p"; done
+for p in etc/nginx etc/mysql etc/postgresql home/isucon/env.sh; do [ -e "/$p" ] && paths="$paths $p"; done
 for s in "$@"; do
   f=$(systemctl show -p FragmentPath --value "$s" 2>/dev/null || true)
   case "$f" in /etc/systemd/system/*) paths="$paths ${f#/}";; esac

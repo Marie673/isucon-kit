@@ -13,19 +13,19 @@ list="$ISU_ROOT/conf/golden.txt"; [ -f "$list" ] || die "conf/golden.txt があ�
 now="$ISU_STATE/golden-now"; rm -rf "$now"; mkdir -p "$now"
 reqs=$({ grep -vE '^[[:space:]]*(#|$)' "$list" || true; } | base64 | tr -d '\n')
 
-isu_sh "$ISU_NGINX_HOST" "$ISU_TARGET_HOST" "$init" "$ISU_INIT_PATH" "${ISU_GOLDEN_JQ:-.}" "$reqs" "${ISU_INIT_ARGS:-}" <<'EOS' | tar -xzf - -C "$now"
-HOST=$1 INIT=$2 INIT_PATH=$3 JQ=$4 REQS=$5 INIT_ARGS=$6
+isu_sh "$ISU_NGINX_HOST" "$ISU_TARGET_HOST" "$init" "$ISU_INIT_PATH" "${ISU_GOLDEN_JQ:-.}" "$reqs" "${ISU_INIT_ARGS:-}" "${ISU_TARGET_SCHEME:-https}" "${ISU_TARGET_PORT:-443}" <<'EOS' | tar -xzf - -C "$now"
+HOST=$1 INIT=$2 INIT_PATH=$3 JQ=$4 REQS=$5 INIT_ARGS=$6 SCHEME=$7 PORT=$8
 D=$(mktemp -d); JAR=$D/.jar
-c() { curl -sk --max-time 30 --resolve "$HOST:443:127.0.0.1" -b "$JAR" -c "$JAR" "$@"; }
+c() { curl -sk --max-time 30 --resolve "$HOST:$PORT:127.0.0.1" -b "$JAR" -c "$JAR" "$@"; }
 if [ "$INIT" = 1 ]; then
   eval "iargs=($INIT_ARGS)"
-  code=$(c -X POST -o "$D/init" -w '%{http_code}' "${iargs[@]}" "https://$HOST$INIT_PATH")
+  code=$(c -X POST -o "$D/init" -w '%{http_code}' "${iargs[@]}" "$SCHEME://$HOST:$PORT$INIT_PATH")
   case "$code" in 2*) ;; *) { echo "HTTP $code"; cat "$D/init"; } > "$D/_INITIALIZE_FAILED.txt" ;; esac
   rm -f "$D/init"
 fi
 echo "$REQS" | base64 -d | while read -r name method path rest; do
   eval "extra=($rest)"
-  code=$(c -X "$method" -o "$D/body" -w '%{http_code}' "${extra[@]}" "https://$HOST$path")
+  code=$(c -X "$method" -o "$D/body" -w '%{http_code}' "${extra[@]}" "$SCHEME://$HOST:$PORT$path")
   { echo "HTTP $code"; jq -S "$JQ" "$D/body" 2>/dev/null || cat "$D/body"; } > "$D/$name.txt"
 done
 rm -f "$D/body" "$JAR"; tar -C "$D" -czf - .

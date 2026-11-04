@@ -4,3 +4,17 @@ target/
 perf.data*
 .DS_Store
 results/*/*/access.log
+
+.env
+*.pem
+*.key
+*.pcap
+*.pcap[0-9]*
+*.pcapng
+results/**/access.log
+results/**/http.jsonl
+results/**/capture.*
+__pycache__/
+
+._*
+results/**/slow.log

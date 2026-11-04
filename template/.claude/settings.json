@@ -19,14 +19,31 @@
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
       "Bash(cargo zigbuild:*)",
-      "Bash(dot:*)",
       "Bash(gh pr view:*)",
       "Bash(gh pr create:*)",
-      "Bash(gh pr comment:*)"
+      "Bash(gh pr comment:*)",
+      "mcp__claude-in-chrome__*",
+      "Bash(uv:*)",
+      "Bash(git push:*)",
+      "Bash(git worktree:*)",
+      "Bash(gwq:*)",
+      "Bash(codex:*)",
+      "Bash(gh api:*)",
+      "Bash(tools/noise/noise:*)",
+      "Bash(tools/flags/flags:*)",
+      "Bash(tools/capture/capture:*)",
+      "Bash(tools/bench-window/bench-window:*)",
+      "Bash(tools/checkpoint/checkpoint:*)",
+      "Bash(tools/stop-rule/stop-rule:*)",
+      "Bash(tools/cpu-features/cpu-features:*)",
+      "Bash(tools/lab-aws/lab-aws:*)"
     ],
     "deny": [
       "Bash(git push --force:*)",
-      "Bash(git reset --hard:*)"
+      "Bash(git reset --hard:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push *--force*)",
+      "Bash(git push *--force-with-lease*)"
     ]
   }
 }

@@ -1,15 +1,8 @@
-#!/usr/bin/env bash
-# isu-backup [label] — 各ホストの /home/isucon/backup/ に DB ダンプと /etc を退避する（開幕直後に必ず1回）
-# 戻すときは手で: zcat ~/backup/<label>-db.sql.gz | sudo mysql <db>  /  sudo tar -C / -xzf ~/backup/<label>-etc.tgz
-. "$(dirname "$0")/lib.sh"
-label=${1:-initial-$(date +%H%M)}
-
-for h in $ISU_HOSTS; do
-  [ -n "$(isu_ip "$h")" ] || continue
-  isu_ssh "$h" "mkdir -p ~/backup && sudo tar -C / -czf ~/backup/$label-etc.tgz etc/nginx etc/mysql etc/systemd/system 2>/dev/null; sudo chown isucon: ~/backup/$label-etc.tgz"
-  ok "$h: ~/backup/$label-etc.tgz"
-done
-if [ -n "$ISU_DB_HOST" ]; then
-  isu_ssh "$ISU_DB_HOST" "sudo mysqldump --single-transaction --routines $ISU_DB_NAME | gzip -1 > ~/backup/$label-db.sql.gz && ls -lh ~/backup/$label-db.sql.gz"
-  ok "$ISU_DB_HOST: ~/backup/$label-db.sql.gz"
-fi
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+from isu_runtime import main
+import sys
+sys.exit(main())
